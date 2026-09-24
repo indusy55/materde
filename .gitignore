@@ -1,0 +1,30 @@
+# ---- 不跟踪文档（2026-09-24 决定：docs 只在本地维护）----
+/docs/
+
+# ---- 参考用外部 clone（即使以后再 clone 进来也不入库）----
+/cosmic-epoch/
+/libcosmic/
+/denial-fork/
+
+# ---- embedder/ 已并入本仓库（基线 sony/flutter-embedded-linux@1653fa6，
+#      与上游差异见 embedder/patches/，其 build/ 由上方 **/build/ 挡住）----
+
+# ---- Flutter/Dart 构建与工具产物 ----
+**/build/
+**/.dart_tool/
+**/.idea/
+*.iml
+coverage/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# ---- flutter create 生成的、我们不目标的平台样板（Wayland only，docs/01 Non-Goals）----
+/shell/android/
+/shell/ios/
+/shell/macos/
+/shell/windows/
+/shell/web/
+/shell/linux/
+
+# ---- PoC 构建产物 ----
+/poc/layer-shell-rs/target/

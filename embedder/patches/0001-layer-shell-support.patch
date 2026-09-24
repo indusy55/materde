@@ -1,0 +1,1862 @@
+diff --git a/.github/workflows/build-test.yml b/.github/workflows/build-test.yml
+deleted file mode 100644
+index 69b5879..0000000
+--- a/.github/workflows/build-test.yml
++++ /dev/null
+@@ -1,92 +0,0 @@
+-name: build-test
+-
+-on: [pull_request, push]
+-
+-env:
+-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
+-  BUILD_TYPE: Release
+-
+-jobs:
+-  build:
+-    runs-on: ubuntu-latest
+-
+-    steps:
+-    - uses: actions/checkout@v3
+-
+-    - name: Install libraries
+-      run: |
+-        sudo apt update
+-        sudo apt install clang-format
+-        sudo apt install libgles2-mesa-dev libegl1-mesa-dev libxkbcommon-dev libwayland-dev libdrm-dev libgbm-dev libinput-dev libudev-dev libsystemd-dev wayland-protocols libx11-dev
+-
+-    - name: Verify formatting
+-      run: |
+-        find src/flutter/shell/platform/linux_embedded/ -iname *.h -o -iname *.cc | xargs clang-format --dry-run --Werror
+-        find src/client_wrapper -iname *.h -o -iname *.cc | xargs clang-format --dry-run --Werror
+-
+-    - name: Create Build Environment
+-      run: cmake -E make_directory ${{github.workspace}}/build
+-
+-    - name: Install Flutter Engine library
+-      #run: |
+-      #  echo `curl https://raw.githubusercontent.com/flutter/flutter/master/bin/internal/engine.version` > embedder.version
+-      #  export FLUTTER_ENGINE=`cat embedder.version`
+-      #  curl -O https://storage.googleapis.com/flutter_infra/flutter/${FLUTTER_ENGINE}/linux-x64/linux-x64-embedder
+-      #  ls
+-      #  unzip linux-x64-embedder
+-      #  mv libflutter_engine.so ${{github.workspace}}/build
+-      run: |
+-        curl -L https://github.com/sony/flutter-embedded-linux/releases/latest/download/elinux-x64-release.zip > elinux-x64-release.zip
+-        unzip elinux-x64-release.zip
+-        mv libflutter_engine.so ${{github.workspace}}/build
+-
+-    - name: Configure CMake for wayland client
+-      shell: bash
+-      working-directory: ${{github.workspace}}/build
+-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DUSER_PROJECT_PATH=examples/flutter-wayland-client ..
+-
+-    - name: Build for wayland client
+-      working-directory: ${{github.workspace}}/build
+-      shell: bash
+-      # Execute the build.  You can specify a specific target with "--target <NAME>"
+-      run: cmake --build . --config $BUILD_TYPE
+-
+-    - name: Configure CMake for drm backend with GBM
+-      shell: bash
+-      working-directory: ${{github.workspace}}/build
+-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DUSER_PROJECT_PATH=examples/flutter-drm-gbm-backend ..
+-
+-    - name: Build for drm backend with GBM
+-      working-directory: ${{github.workspace}}/build
+-      shell: bash
+-      run: cmake --build . --config $BUILD_TYPE
+-
+-    - name: Configure CMake for drm backend with EGLStream
+-      shell: bash
+-      working-directory: ${{github.workspace}}/build
+-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DUSER_PROJECT_PATH=examples/flutter-drm-eglstream-backend ..
+-
+-    - name: Build for drm backend with EGLStream
+-      working-directory: ${{github.workspace}}/build
+-      shell: bash
+-      run: cmake --build . --config $BUILD_TYPE
+-
+-    - name: Configure CMake for x11 backend
+-      shell: bash
+-      working-directory: ${{github.workspace}}/build
+-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DUSER_PROJECT_PATH=examples/flutter-x11-client ..
+-
+-    - name: Build for x11 backend
+-      working-directory: ${{github.workspace}}/build
+-      shell: bash
+-      run: cmake --build . --config $BUILD_TYPE
+-
+-    - name: Configure CMake to build libflutter_elinux.so
+-      shell: bash
+-      working-directory: ${{github.workspace}}/build
+-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBUILD_ELINUX_SO=ON -DBACKEND_TYPE=WAYLAND ..
+-
+-    - name: Build libflutter_elinux.so
+-      working-directory: ${{github.workspace}}/build
+-      shell: bash
+-      run: cmake --build . --config $BUILD_TYPE
+diff --git a/LAYER-SHELL-NOTES.md b/LAYER-SHELL-NOTES.md
+new file mode 100644
+index 0000000..df0a985
+--- /dev/null
++++ b/LAYER-SHELL-NOTES.md
+@@ -0,0 +1,514 @@
++# Embedder Layer-Shell 改造笔记（Phase 0 第 5/6 项）
++
++> 目标：给 fork 的 `flutter-embedded-linux` 加 `wlr-layer-shell` 支持，让 Flutter 应用能创建
++> shelf/overlay layer surface。本文沉淀全部调研结论，避免重复思考。
++> 状态：**调研完成，代码未写**。两个已确认的阻塞见 §9。
++
++## 0. 相关路径
++
++| 路径 | 说明 |
++|---|---|
++| `MaterDE/embedder/` | sony/flutter-embedded-linux fork（基线 `1653fa6`，已并入 materde 主仓库） |
++| `MaterDE/protocol/wlr-layer-shell-unstable-v1.xml` | 本地协议 XML（19326 字节，v5） |
++| `MaterDE/protocol/xdg-shell.xml` | 本地 xdg-shell XML |
++| ~~`MaterDE/poc/layer-shell-rs/`~~ | Rust PoC，验收通过后已删除（2026-09-24）；结论沉淀在本文与 docs/08 Go/No-Go 证据摘要 |
++| `/tmp/opencode/ls.h` | 已用 wayland-scanner 生成的 layer-shell client header（验证用） |
++
++## 1. 结论：上游完全没有 layer-shell
++
++```
++grep -rn "layer_shell|zwlr|wlr-layer" embedder-upstream/  → 无匹配
++```
++
++Wayland 实现在 `window/elinux_window_wayland.cc`（1931 行），只走 xdg-shell 普通窗口。
++docs/08 风险 #1（HIGH, 30%）确认成立：必须自己写 C++ 协议代码。
++
++## 2. 构建体系（已验证全部依赖可用）
++
++- **CMake 强制 clang**（`CMakeLists.txt` 顶部 set CMAKE_CXX_COMPILER clang），本机 clang 22.1.8 ✅
++- C++17；`cmake_minimum_required(VERSION 3.10)`
++- 构建命令：
++  ```bash
++  cd embedder-upstream
++  cmake -G Ninja -DUSER_PROJECT_PATH=examples/flutter-wayland-client -B build
++  ninja -C build
++  ```
++- 协议生成在 `cmake/build.cmake` 的 wayland 分支（约 line 40-82）：
++  `pkg_get_variable(WAYLAND_PROTOCOLS_DATADIR wayland-protocols pkgdatadir)` →
++  `generate_wayland_client_protocol(PROTOCOL_FILE CODE_FILE HEADER_FILE)`（函数在 `cmake/generate_wayland_protocols.cmake`，内部调 `wayland-scanner client-header` / `private-code`）
++  生成到 `${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/wayland/protocols/`，
++  生成的 .c 加入 `DISPLAY_BACKEND_SRC`。
++- 现有生成 5 个协议：xdg-shell、text-input-v1、text-input-v3、presentation-time、xdg-decoration。
++- 依赖检查 `cmake/package.cmake`：egl ✅ xkbcommon ✅ wayland-client/cursor/egl ✅
++  **`wayland-protocols` ❌ 未安装**（见 §9 阻塞 2），glesv2 ✅
++- 链接 `build/libflutter_engine.so`（`cmake/build.cmake:272`）——**该文件不存在**，
++  完整链接需要 flutter-elinux 工具链下载引擎产物。见 §10。
++
++## 3. 关键源码坐标（改造点）
++
++### 3.1 公共 API：`src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h`
++- `enum FlutterDesktopViewMode { kNormalscreen=0, kFullscreen=1 }` (line ~60)
++  → 加 `kLayerShell = 2`
++- `FlutterDesktopViewProperties` 结构（width/height/view_rotation/view_mode/title/app_id/
++  use_mouse_cursor/use_onscreen_keyboard/use_window_decoration/text_scale_factor/
++  enable_high_contrast/force_scale_factor/scale_factor/enable_vsync）
++  → 末尾追加 layer-shell 字段（见 §5）
++- 已 `#include <stdint.h>`，可直接用 uint32_t/int32_t
++- 导出函数 `FlutterDesktopViewControllerCreate(view_properties, engine)` (line ~141)
++
++### 3.2 C++ wrapper：`src/client_wrapper/`
++- `include/flutter/flutter_view_controller.h`
++  - `enum ViewMode { kNormal=0, kFullscreen=1 }` (line 29) → 加 `kLayerShell=2`
++  - `typedef struct {...} ViewProperties;` (line ~47) → 加字段
++- `flutter_view_controller.cc:17` 构造 `FlutterDesktopViewProperties c_view_properties = {};`
++  逐字段拷贝（line 18-47），`view_mode` 三元转换在 line 28-31 → 改成 switch/映射
++  **所有构造点用 `= {}` 零初始化，追加字段安全**
++
++### 3.3 窗口实现：`window/elinux_window_wayland.{h,cc}`
++头文件已有 extern "C" 包含 5 个生成协议头（h line 23-29）→ 追加 layer-shell 头。
++
++`elinux_window_wayland.h` 需加：
++```cpp
++static const zwlr_layer_surface_v1_listener kZwlrLayerSurfaceV1Listener;
++zwlr_layer_shell_v1* zwlr_layer_shell_v1_ = nullptr;
++zwlr_layer_surface_v1* zwlr_layer_surface_v1_ = nullptr;
++bool layer_surface_configured_ = false;
++```
++（现有成员初始化风格：构造函数 init list 里显式 `=nullptr`，如 xdg_toplevel_(nullptr)）
++
++`elinux_window_wayland.cc` 四处改动：
++1. **registry 绑定** — `WlRegistryHandler()` (line 1620 起)，照 `xdg_wm_base` 分支抄：
++   ```cpp
++   if (!strcmp(interface, zwlr_layer_shell_v1_interface.name)) {
++     constexpr uint32_t kMaxVersion = 5;
++     zwlr_layer_shell_v1_ = static_cast<decltype(zwlr_layer_shell_v1_)>(
++         wl_registry_bind(wl_registry, name, &zwlr_layer_shell_v1_interface,
++                          std::min(kMaxVersion, version)));
++     return;
++   }
++   ```
++2. **listener 定义** — 照 `kXdgSurfaceListener` 模式（line 69-113），见 §6
++3. **`CreateRenderSurface()`** (line 1364) — 分支点，见 §7
++4. **清理** — `DestroyRenderSurface()`（xdg_surface_ 销毁处，line ~1290）+ 析构函数
++   （line ~1180 起，x
++
++, zxdg_decoration 销毁处）→ 销毁 layer surface / layer_shell
++
++### 3.4 其它 view_mode 判断点（需确认不误伤）
++- `elinux_window_wayland.cc:683` — wl_output.mode 回调里 `if (view_mode == kFullscreen)`
++  → kLayerShell 不受影响，但**要跳过"clip 到 display 尺寸"逻辑**（layer surface 尺寸由 compositor 决定）
++- `elinux_window_wayland.cc:1384,1438` — CreateRenderSurface 内两处 kFullscreen
++- `elinux_window_drm.h:195` — DRM 后端强制 fullscreen（无关，我们只做 WAYLAND）
++- `elinux_window_x11.cc:136` — X11（无关）
++
++### 3.5 尺寸回传链（layer surface configure 后要走通）
++```
++configure 事件 → 更新 view_properties_.width/height + request_redraw_=true
++→ DispatchEvent() (line 1305) 检测 request_redraw_
++→ binding_handler_delegate_->OnWindowSizeChanged(w*scale, h*scale - decoration_h)  // line 1318
++→ FlutterELinuxView::OnWindowSizeChanged (flutter_elinux_view.cc:96)
++   → GetRenderSurfaceTarget()->OnScreenSurfaceResize(w_px, h_px)
++      → SurfaceBase::OnScreenSurfaceResize (surface_base.cc:32)
++         → onscreen_surface_->SurfaceResize + native_window_->Resize(wl_egl_window_resize)
++   → SendWindowMetrics(w, h, dpi_scale)  // 通知 Flutter 引擎
++```
++即：**configure 里只需更新 view_properties_ + request_redraw_，resize 由现有链路自动完成**。
++
++## 4. 生成的 layer-shell C API（已用 wayland-scanner 1.26.0 实测）
++
++```c
++// enum 数值（实测）
++ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND = 0
++ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM     = 1
++ZWLR_LAYER_SHELL_V1_LAYER_TOP        = 2
++ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY    = 3
++ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP     = 1
++ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM  = 2
++ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT    = 4
++ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT   = 8
++ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE      = 0
++ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE = 1
++ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND = 2  // @since 4
++
++// 关键函数（注意：全是裸 uint32_t 参数，不是 enum 类型）
++zwlr_layer_shell_v1_get_layer_surface(shell, surface, output_or_NULL,
++                                      uint32_t layer, const char *ns)  // ← namespace 是 C++ 关键字！
++zwlr_layer_shell_v1_destroy(shell)            // SINCE_VERSION 3
++zwlr_layer_surface_v1_set_size(ls, uint32_t w, uint32_t h)
++zwlr_layer_surface_v1_set_anchor(ls, uint32_t anchor)              // bitmask
++zwlr_layer_surface_v1_set_exclusive_zone(ls, int32_t zone)
++zwlr_layer_surface_v1_set_keyboard_interactivity(ls, uint32_t k)
++zwlr_layer_surface_v1_ack_configure(ls, uint32_t serial)
++zwlr_layer_surface_v1_destroy(ls)             // SINCE_VERSION 1
++```
++listener：`zwlr_layer_surface_v1_listener { configure(serial,w,h); closed(); }`
++
++## 5. 计划的公共 API 扩展（flutter_elinux.h）
++
++```c
++enum FlutterDesktopViewMode {
++  kNormalscreen = 0,
++  kFullscreen   = 1,
++  kLayerShell   = 2,   // 新增
++};
++
++typedef struct {
++  FlutterDesktopLayerShellLayer layer;   // 0..3，对应 enum 值
++  uint32_t anchor;                       // bitmask
++  int32_t  exclusive_zone;
++  const char* layer_namespace;           // 避开 C++ 关键字
++  uint32_t keyboard_interactivity;
++} FlutterDesktopLayerShellProperties;
++// FlutterDesktopViewProperties 末尾追加:
++//   FlutterDesktopLayerShellProperties layer_shell;
++```
++C++ wrapper `ViewProperties` 同步加同名字段（`std::optional<std::string>` 存 namespace）。
++
++## 6. configure listener 设计（照 kXdgSurfaceListener 模式）
++
++```cpp
++const zwlr_layer_surface_v1_listener ELinuxWindowWayland::kZwlrLayerSurfaceV1Listener = {
++  .configure = [](void* data, zwlr_layer_surface_v1* ls, uint32_t serial,
++                  uint32_t width, uint32_t height) {
++    auto self = reinterpret_cast<ELinuxWindowWayland*>(data);
++    zwlr_layer_surface_v1_ack_configure(ls, serial);   // ← 必须先 ack！（C 版 PoC 漏了）
++    // width/height 是 compositor 裁定的逻辑尺寸；0 表示沿用请求值
++    if (width > 0 && height > 0 &&
++        (self->view_properties_.width != (int)width ||
++         self->view_properties_.height != (int)height)) {
++      self->view_properties_.width = width;
++      self->view_properties_.height = height;
++      self->request_redraw_ = true;   // 触发 §3.5 的 resize 链路
++    }
++    self->layer_surface_configured_ = true;
++    if (self->wait_for_configure_) self->wait_for_configure_ = false;
++  },
++  .closed = [](void* data, zwlr_layer_surface_v1* ls) {
++    auto self = reinterpret_cast<ELinuxWindowWayland*>(data);
++    self->running_ = false;
++  },
++};
++```
++
++## 7. CreateRenderSurface 分支设计（line 1364）
++
++现有流程（xdg 路径）：
++```
++校验 display/wl_compositor/xdg_wm_base
++→ (kFullscreen 时用 display 尺寸覆盖)
++→ 建 wl_cursor_surface（如需）
++→ rotation 交换 w/h
++→ native_window_ = NativeWindowWayland(compositor, w, h, vsync)   // 内部 wl_compositor_create_surface + wl_egl_window_create
++→ wl_surface_add_listener
++→ xdg_wm_base_get_xdg_surface + get_toplevel + add_listener + set_title/app_id
++→ wl_surface_set_buffer_scale(scale)
++→ wl_surface_frame + presentation feedback
++→ (kFullscreen: set_fullscreen)
++→ wait_for_configure_=true; wl_surface_commit()
++→ render_surface_ = SurfaceGl(ContextEgl(EnvironmentEgl))
++→ (decoration)
++→ while(wait_for_configure_) wl_display_dispatch()   // 阻塞等 configure
++```
++
++layer-shell 分支改 3 处：
++1. 早退校验：`if (!xdg_wm_base_)` → layer 模式改为 `if (!zwlr_layer_shell_v1_)`
++2. `xdg_get_surface/get_toplevel` 块 → 换成：
++   ```cpp
++   zwlr_layer_surface_v1_ = zwlr_layer_shell_v1_get_layer_surface(
++       zwlr_layer_shell_v1_, native_window_->Surface(), /*output=*/nullptr,
++       ls_props.layer, ls_props.layer_namespace);
++   zwlr_layer_surface_v1_add_listener(zwlr_layer_surface_v1_,
++                                      &kZwlrLayerSurfaceV1Listener, this);
++   zwlr_layer_surface_v1_set_size(ls, view_properties_.width, view_properties_.height);
++   zwlr_layer_surface_v1_set_anchor(ls, ls_props.anchor);
++   zwlr_layer_surface_v1_set_exclusive_zone(ls, ls_props.exclusive_zone);
++   zwlr_layer_surface_v1_set_keyboard_interactivity(ls, ls_props.keyboard_interactivity);
++   ```
++   **注意 shelf 规格（docs/03 §5, docs/04 §1）**：
++   `set_size(0, 48)` 宽 0=由 compositor 按 anchor 决定；anchor=Bottom|Left|Right(2|4|8=14)；
++   `exclusive_zone=48`；`keyboard_interactivity=None(0)`；layer=Bottom(1)
++3. 跳过：decoration 创建、kFullscreen 的 set_fullscreen、"clip 到 display 尺寸"
++4. `wait_for_configure_` 阻塞循环保留（layer surface 同样需要等首次 configure）
++
++**尺寸坑**：`set_size(0,48)` 时 `native_window_` 初值 w 可能是 0/默认 1280。
++configure 回来真实宽度（如 1646）后由 §3.5 链路 resize `wl_egl_window`。需确认初值不为 0
++（`wl_egl_window_create(surface, 0, 48)` 可能失败）→ 分支里若 width<=0 先用
++`display_max_width_`（wl_output.mode 已在构造 roundtrip 里拿到）兜底。
++
++## 8. 示例程序 CLI（`examples/flutter-wayland-client/`）
++
++- `flutter_embedder_options.h`：`AddWithoutValue/AddInt/AddDouble/AddString` 注册选项，
++  `Parse()` 里 `Exist(name)` / `GetValue<T>(name)`，getter 转发。
++  WAYLAND 分支在 `#else // FLUTTER_TARGET_BACKEND_WAYLAND`（line ~120-130）。
++  → 加 `--layer-shell`、`--layer`、`--anchor`、`--exclusive-zone`、`--namespace`、`--keyboard`
++- `main.cc:29-43` 把 options 填进 `view_properties` → 追加 layer 字段
++- `cmake/user_build.cmake`：TARGET=flutter-client，已含三个源文件
++
++## 9. 两个阻塞（**均已解除 ✅**，以下保留原始分析）
++
++- **阻塞 A 解法 = A1（已实现）**：`cmake/generate_wayland_protocols.cmake` 加
++  `PATCH_NS_KEYWORD` 开关，wayland-scanner 之后跑两条 sed
++  （`-e "s/\*namespace)/\*ns)/" -e "s/, namespace)/, ns)/"`）。
++  ⚠️ CMake 里**不能用 `;` 分隔 sed 表达式**（`set()` 的列表会被 `;` 拆开），
++  必须写成两个 `-e`。已实测：生成头第 225 行 `const char *ns`、第 230 行 `, ns);`。
++- **阻塞 B 解法**：用户已执行 `sudo pacman -S wayland-protocols`，
++  `pkg-config --exists wayland-protocols` → OK，`/usr/share/wayland-protocols`，
++  版本 1.49。
++
++### 阻塞 A（原）：`namespace` 是 C++ 关键字 → 生成的头文件编译失败（已实测复现）
++```
++error: invalid parameter name: 'namespace' is a keyword
++  zwlr_layer_shell_v1_get_layer_surface(..., const char *namespace)
++```
++**解决方案（选一）**：
++- **A1（推荐）**：CMake 生成后加 sed 命令把 `namespace` → `ns`：
++  ```cmake
++  add_custom_command(OUTPUT ${hdr}
++    COMMAND wayland-scanner client-header ${xml} ${hdr}
++    COMMAND sed -i "s/\\*namespace)/\\*ns)/g; s/, namespace)/, ns)/g" ${hdr}
++    DEPENDS ${xml} VERBATIM)
++  ```
++  需改 `cmake/generate_wayland_protocols.cmake` 或为 layer-shell 单独写一条。
++- **A2**：手写一个 `layer_shell_shim.h`，只声明需要的函数（避开生成头）→ 维护成本高。
++- **A3**：把 layer-shell 调用放进独立 `.c` 文件（C 允许 namespace 作标识符），
++  C++ 侧只 include 自己的 shim 头。
++
++### 阻塞 B：系统未安装 `wayland-protocols`
++```
++pacman -Qi wayland-protocols → 未找到
++pkg-config --exists wayland-protocols → MISSING
++```
++`cmake/package.cmake:36` 是 `REQUIRED`，不装则 **configure 直接失败**。
++xdg-shell.xml / text-input / presentation-time / xdg-decoration 全来自它。
++**需 sudo**：`sudo pacman -S wayland-protocols`（本地 `protocol/xdg-shell.xml` 可备用，但另外 4 个没有）
++→ **用户已确认自己在终端执行**，我继续写代码，稍后验证 pkg-config。
++
++## 9bis. Context7 查询结论（`/sony/flutter-embedded-linux` + `/sony/flutter-elinux`）
++
++**能查到什么 / 查不到什么**：
++- ctx7 有这两个库（185 / 180 snippets），但索引内容 = **README + wiki**，**没有源码里的
++  struct 定义**。`FlutterDesktopViewProperties` / `FlutterDesktopViewMode` 字段查询
++  直接 "No documentation matched"。
++- ⇒ 结论：**构建/运行策略先查 ctx7，struct 字段级细节才翻源码**。以后先 ctx7。
++
++**ctx7 直接解掉的两个阻塞**：
++
++1. **`libflutter_engine.so` 怎么来**（原 §10 障碍）
++   - 必须放在 **CMake build 目录**（`build/`）里。
++   - 官方下载：`curl -O https://storage.googleapis.com/flutter_infra/flutter/FLUTTER_ENGINE/linux-x64/linux-x64-embedder`
++     （`FLUTTER_ENGINE` 换成目标 engine SHA）
++   - 或从 engine 源码构建后 `cp ./out/<target>/libflutter_engine.so <cmake_build_dir>`
++
++2. **embedder `.so` 是预编译的**（新认知，影响整个 fork 策略）
++   - flutter-elinux 构建 app 时自动下载 artifact 到
++     `<flutter-elinux_install>/flutter/bin/cache/artifacts/engine/`，
++     其中含 `libflutter_engine.so` **和 `libflutter_elinux_wayland.so`**。
++   - 即：**正常流程里 embedder 根本不重新编译**。fork 加 layer-shell ⇒
++     要么自己 `ninja` 出 `.so` 覆盖 artifact，要么走本地 artifact 目录。
++   - 本地 artifact 覆盖开关（wiki: Use-local-elinux-artifacts）：
++     ```
++     export ELINUX_ENGINE_BASE_LOCAL_DIRECTORY=<已下载 artifacts 的路径>
++     export ELINUX_ENGINE_BASE_URL=<自建 artifact server>   # 默认 https://github.com/sony/flutter-embedded-linux/releases
++     ```
++   - glibc 约束：`libflutter_engine.so` 用 Chromium clang + glibc 2.29 构建；
++     `libflutter_elinux_*.so` 用 Ubuntu 18.04 clang + **glibc 2.27** 构建。
++
++**其它 ctx7 拿到的运行/构建事实**：
++- embedder 构建（wiki）：`mkdir build && cd build && cmake -DUSER_PROJECT_PATH=examples/flutter-video-player-plugin .. && cmake --build .`
++- `flutter-client` CLI（wiki: How-to-run-Flutter-apps）：
++  `-b` bundle、`-n` 关光标、`-r` 旋转、`-x/-s` 缩放、`-v` async vblank、
++  `-t` title、`-a` app-id、`-k` on-screen keyboard、`-d` decoration、
++  `-f` fullscreen、`-w/-h` 尺寸。
++  → 加我们的 `--layer-shell/--layer/--anchor/--exclusive-zone/--namespace/--keyboard`
++- 不经 flutter-elinux 跑：`./build/<arch>/<mode>/bundle/<app> --help`
++- 传自定义参数：`FLUTTER_ELINUX_CUSTOM_RUN_ARGS="--width=640 --height=480" flutter-elinux run -d elinux-wayland`
++- app runner CMake：`FLUTTER_TARGET_BACKEND_TYPE` → `-DFLUTTER_TARGET_BACKEND_WAYLAND`；
++  wrapper 链 `flutter` + `flutter_wrapper_app`；`${EPHEMERAL_DIR}/flutter_elinux.h`
++
++## 10. 运行时验证的额外障碍（Phase 0 收尾时处理）
++
++- ~~链接需要 `build/libflutter_engine.so`，本机不存在，来源不明~~
++  → **已由 §9bis 解决**：放进 CMake build 目录即可，官方有下载 URL。
++  本机有 `~/fvm/versions/3.47.4`（Flutter 3.47.4 / Dart 3.13.3），但不是 elinux SDK。
++- 替代验证路径（成本从低到高）：
++  1. **只验证编译**：`ninja` 到 .o 全通过即可证明 C++ 改造正确（阶段目标）
++  2. 装 flutter-elinux SDK → 构建 bundle → 真跑 layer surface
++  3. 复用 Rust PoC 的验收截图法（spectacle 可用，grim 不支持 KWin）
++- 环境：KWin Wayland，`zwlr_layer_shell_v1 v5`，plasmashell 底栏视觉冲突，
++  单屏 eDP-1 1646x1029 logical（scale 1.75，`wl_output.scale` 报整数 2）。
++
++## 11. 待办执行顺序 —— **步骤 1–10 全部完成 ✅**
++
++| # | 任务 | 状态 |
++|---|------|------|
++| 1 | `pacman -S wayland-protocols` | ✅ 用户执行，1.49 |
++| 2 | `libflutter_engine.so` 进 `build/` | ✅ 见 §12 |
++| 3 | `mv embedder-upstream embedder` | ✅ 对齐 docs/09 |
++| 4 | CMake layer-shell 生成 + sed | ✅ `PATCH_NS_KEYWORD` |
++| 5 | `flutter_elinux.h` kLayerShell + 层字段 | ✅ |
++| 6 | wrapper `.h` + `.cc` 映射 | ✅ |
++| 7 | `elinux_window_wayland.h` 声明 | ✅ |
++| 8 | `elinux_window_wayland.cc` 全部逻辑 | ✅ |
++| 9 | example CLI | ✅ 6 个新选项 |
++| 10 | configure + ninja | ✅ 55/55 .o + 链接 |
++| 11 | 文档验收状态 | ✅ §12 |
++
++**剩余**：~~真实 Flutter bundle（§13 决策点）→ 才能出画面（Phase 0 #7 视觉验收）~~
++→ **已解除 ✅**，见 §12「真实 bundle 视觉验收」。**Phase 0 全部完成。**
++
++## 12. 验收记录（2026-09-24）
++
++### 编译 / 链接
++```
++cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -DUSER_PROJECT_PATH=examples/flutter-wayland-client -B build
++ninja -C build          # 55/55 .o，0 error，3 warning 全是上游 wstring_convert 弃用
++                        # flutter-client 12.9MB 链接成功
++LD_LIBRARY_PATH=build ./build/flutter-client --help   # 6 个新 layer 选项全部出现
++```
++- **顺带修复**：clang 22 不再传递包含 `<cstdint>`，给 `client_wrapper` 16 个文件补
++  `#include <cstdint>`（上游与新 clang 的既有问题，与 layer-shell 无关）。
++- **顺带修复**：`LayerShellProperties` 匿名 typedef 触发
++  `-Wnon-c-typedef-for-linkage` → 改成 `typedef struct LayerShellProperties {...}`。
++
++### 运行时（假 bundle，engine 在 AOT 阶段即退出，但 layer 路径已走完）
++> ⚠️ **日志级别默认 WARNING**，要看到我们自己的 INFO/TRACE 必须
++> `FLUTTER_LOG_LEVELS=TRACE`（`logger.cc`，环境变量 `FLUTTER_LOG_LEVELS`）。
++
++```
++LD_LIBRARY_PATH=build FLUTTER_LOG_LEVELS=TRACE ./build/flutter-client \
++  -b <bundle> --layer-shell -w 0 -h 48 -L 1 -A 14 -e 48 -N materde-shelf -y 0
++```
++实测输出（KWin / eDP-1）：
++```
++[TRACE] Created the Wayland surface: 1280x720                 # 占位尺寸
++[INFO]  Created the layer surface: layer=1, anchor=14,
++        exclusive_zone=48, keyboard_interactivity=0           # shelf 规格正确
++[INFO]  Display output info: width = 2880, height = 1800, refresh = 90000
++[INFO]  Display scale for output(13): 2
++[INFO]  zwlr_layer_surface_v1_listener.configure: 1646x48     # ✅ 全逻辑宽 × shelf 高
++[INFO]  layer surface resized to 1646x48                      # ✅ ack + 回写生效
++```
++**结论**：registry 绑定 `zwlr_layer_shell_v1` → `get_layer_surface` → commit →
++KWin 回 configure → ack → 回写 `view_properties_` + `request_redraw_`，
++**与 Rust PoC 的 `configure 1646x48` 完全一致**。docs/08 风险 #1（上游无 layer-shell）已覆盖。
++
++### 单位事实（踩过的坑）
++- `wl_output.mode` 给的是 **物理** 2880×1800；`wl_output.scale` 报整数 **2**；
++  但 layer `configure` 给的是 **逻辑 1646**（= 2880 / 1.75 真实缩放）。
++- ⇒ 占位 EGL 尺寸**不能**再乘 `current_scale_`，否则变 5760。已在代码里修。
++- ⇒ `display_max_width_` 在 `CreateRenderSurface` 时还是 0（registry 的 wl_output
++  事件要第二个 roundtrip 才到），所以实际走的是 `1280x720` 兜底，configure 再纠正。
++- 分数缩放 1.75：embedder 只认整数 scale=2 → 渲染 3292 buffer px 显示在 2880 物理上，
++  **略微超采样（偏软但正确）**，upstream 的既有行为，不是本 fork 引入的。
++
++### 关键运行事实（以后别再踩）
++| 事实 | 值 |
++|---|---|
++| 日志级别 | `FLUTTER_LOG_LEVELS=TRACE\|DEBUG\|INFO\|WARNING\|ERROR`，**默认 WARNING** |
++| bundle 结构 | `<bundle>/data/flutter_assets`、`<bundle>/data/icudtl.dat`、`<bundle>/lib/libapp.so` |
++| loader 路径 | `CMAKE_SKIP_RPATH=true` ⇒ 必须 `LD_LIBRARY_PATH=build` |
++| 截图 | `grim` 不支持 KWin，用 `spectacle -b -n -o <path>` |
++| 假 bundle 现成的 | `/tmp/opencode/fakebundle`（含真实 `icudtl.dat`，来自 `elinux-common.zip`） |
++| `pkill -f "build/..."` | ⚠️ 会匹配外层 shell 自身命令行把它杀掉（输出凭空消失）。用 `pkill -x flutter-client` |
++| 后台跑 client | `nohup ... & echo "pid=$!"; sleep N; cat log` 放同一条命令里，否则 harness 可能回收子进程 |
++
++### 真实 bundle 视觉验收（Phase 0 #7 ✅，2026-09-24）
++
++工具链按 §13 **方案 A** 落地（Flutter 3.29.3 / Dart 3.7.2 / engine `cf56914b32`，
++SDK 在 `~/flutter-elinux`），`shell/` 降级到 Dart `^3.7.0` +
++`material-color-utilities 0.11.1` + `flutter_lints ^5.0.0`（6.0.0 要 Dart 3.8）。
++7 个 elinux artifact zip 本地化到 `/tmp/opencode/`，
++用 `ELINUX_ENGINE_BASE_LOCAL_DIRECTORY=/tmp/opencode` 免重下。
++
++**验收命令与输出**：
++```
++ELINUX_ENGINE_BASE_LOCAL_DIRECTORY=/tmp/opencode ~/flutter-elinux/bin/flutter-elinux \
++  build elinux --release            # → shell/build/elinux/x64/release/bundle/
++
++LD_LIBRARY_PATH=build FLUTTER_LOG_LEVELS=INFO ./build/flutter-client \
++  -b <bundle> --layer-shell -w 0 -h 48 -L 1 -A 14 -e 48 -N materde-shelf -y 0
++# Created the layer surface: layer=1, anchor=14, exclusive_zone=48, keyboard_interactivity=0
++# configure: 1646x48 → layer surface resized to 1646x48（两次 configure）
++```
++**截图**：`docs/assets/shelf-phase0-acceptance.png`
++（2880×1800，底部 84 物理 px = 48 逻辑 × 1.75 全宽 `#CFBCFF` = 主题 `primary`，
++非 band 区域是桌面壁纸色，边界在 y=1717）。
++
++**同场验证的三条 docs/07 Verification**：
++1. ✅ layer surface 上渲染出 colored rectangle（上图，全宽 primary）
++2. ✅ Material You 主题从 seed 生成 —— overlay 探针（800×360 / layer=3 / anchor=5）
++   看到 primary 色块 + `onPrimary` 文字 + 6 个 seed 色板 + 亮度按钮
++3. ✅ 改 seed → 主题更新 —— `MATERDE_SEED=#006A6A` 重启后整套角色重算
++   （`/tmp/opencode/shots/teal_crop.png`：primary 变青、选中勾移到青色板）
++
++**调试过程沉淀（避免重走）**：
++- shelf 48px 高度装不下验收页（`Column` 的 `Expanded` 被挤成 0、控制区溢出），
++  只剩 `surfaceContainer` 底色。⇒ `_HomeView` 加 `LayoutBuilder`：
++  `maxHeight < 220` 时直接返回 `ColoredBox(scheme.primary)`（正是 docs/07 要的色块）。
++- 判定"渲染了但不是色块" vs "没渲染"的方法：给视口画 `MediaQuery.sizeOf` 红字，
++  一次截图同时回答 metrics 是否正确 + 内容是否 paint（拿到 `1646x48 dpr=2.00` 即证）。
++  验收前必须清掉该诊断（`strings libapp.so | grep -c metricsTag` 应为 0）。
++- **并行 shell 调用会让截图与重建赛跑**：截到旧 `libapp.so` 的画面（还带红字）。
++  重建 + 启动 + 截图必须**串行**在同一条命令里，且先 `md5sum libapp.so` 留证。
++- 短视口探针（800×100 / 800×48）在 bottom layer 会被 plasmashell/终端盖住，
++  要看小 surface 就用 `-L 3 -A 5`（overlay + top|left）。
++
++## 13. 工具链决策 —— **已拍板并执行：方案 A ✅（2026-09-24）**
++
++> **结论**：采用 **A = flutter-elinux `main` → Flutter 3.29.3 / Dart 3.7.2 /
++> engine `cf56914b32`**，已装在 `~/flutter-elinux`（仓库外，避免污染 git），
++> release bundle 构建 + 真实 layer surface 渲染全部跑通，Phase 0 #7 验收见 §12。
++> 下面保留原始分析与 B/C/D 供以后升级版本时参考。
++
++**硬约束**：surface 只有在 Flutter 真正渲染、commit 一个 buffer 后才会**可见**。
++engine 卡在 AOT（没有 `libapp.so`）⇒ 永远黑屏 ⇒ Phase 0 #7「看到色块」无法验收。
++所以必须有一条能产出 elinux bundle 的 Flutter 工具链。
++
++**版本对齐现状**（原始调研，全部已实测）：
++| 来源 | Flutter | engine artifact |
++|---|---|---|
++| 本机 fvm | **3.47.4**（Dart 3.13.3, 2026-09） | — |
++| flutter-elinux `main` ← **选了这个** | **3.29.3** | `cf56914b32` |
++| flutter-elinux 最新 release | **3.27.1**（2024-12） | `cb4b5fff73` |
++| 早期下到 `build/` 的 engine | ~~3.32.8 / `ef0cd00091`~~ **已作废**（现用 `cf56914b32`） | |
++
++- flutter-elinux **不是完整 SDK**，是包装器：按 `bin/internal/flutter.version`
++  `git clone --depth=1 flutter/flutter -b <tag>` 到 `$ROOT/flutter`，
++  再按 `bin/internal/engine.version` 下 artifact。改这两行就能换版本。
++- 本机 `~/fvm/versions/3.47.4/engine/src` **有引擎源码**，但要 depot_tools +
++  `gclient sync`（数 GB）+ gn/ninja 编译，且 flutter-elinux 完全不支持 3.47.4。
++
++**候选方案**：
++- **A（推荐）**：flutter-elinux `main` → Flutter **3.29.3** + `cf56914b32`。
++  最省、官方对齐。代价：clone Flutter 3.29.3（`--depth=1`）+ 下 cf56914b32 artifact，
++  再把 `build/libflutter_engine.so` 换成同版并重链 embedder。
++  ⇒ `shell/` 项目要按 3.29.3 写（`material-color-utilities` 版本要跟着降）。
++- **B**：Flutter **3.32.8**（engine so 已在手）。改 flutter-elinux 两行版本钉。
++  更新，但 flutter-elinux 自定义命令要能对上 3.32.8 的 `flutter_tools` API，**非官方组合**。
++- **C**：自建 **3.47.4** 引擎。最贵（数 GB + 长编译），flutter-elinux 还得自己打补丁。
++- **D**：不跑真实 bundle，只交编译级验收。（用户否决 —— Phase 0 #7 要求看到色块）
++
++### 执行记录（方案 A 的落地细节）
++
++| 步骤 | 结果 |
++|---|---|
++| `git clone flutter-elinux` → `~/flutter-elinux` + `setup` | Flutter **3.29.3** / Dart **3.7.2** / framework `ea121f8859` / DevTools 2.42.3 |
++| engine `cf56914b32` 的 `elinux-x64-release.zip` | 早已在 `embedder/build/libflutter_engine.so`，md5 `d0c292e33ef0ab6eb8fd5073ba91504d` 对上 ⇒ **无需重下、无需重链 embedder** |
++| 7 个 artifact zip 下载被断 | 改吃本地 `/tmp/opencode/elinux-*.zip`（`unzip -t` 全通过），靠 `ELINUX_ENGINE_BASE_LOCAL_DIRECTORY` 注入 |
++| `shell/` 降级 | Dart `^3.7.0`、`material_color_utilities 0.11.1`、`flutter_lints ^5.0.0`（6.0.0 要 Dart 3.8） |
++| `flutter-elinux create --platforms elinux .` | 生成 `shell/elinux/` 平台目录 |
++| `flutter-elinux build elinux --release` | ✅ `lib/libapp.so` 3.2MB AOT + engine so + icudtl + flutter_assets |
++| 并发 flutter 命令 | ⚠️ 抢 startup lock 会损坏 CMake 缓存 ⇒ **必须串行**；失败时清 `build/elinux/x64/*/CMakeFiles` 重跑 |
++
++### 仓库合并记录（2026-09-24）
++
++- `embedder/.git`（origin=sony/flutter-embedded-linux，基线 `1653fa6`）已并入
++  **materde 主仓库**，变为普通目录；根仓库 origin = `git@github.com:indusy55/materde.git`。
++- 与上游的完整差异固化为 `embedder/patches/0001-layer-shell-support.patch`：
++  layer-shell 改造（24 文件，+374/-25）、CMake `namespace→ns`、example CLI 6 选项、
++  `cstdint` 修复，以及删除上游 CI（`.github/workflows/build-test.yml`）。
++- 同步上游方法：clone sony 仓库 → 把上游增量 patch 打到 `embedder/` → 解决冲突 →
++  重新 `git diff` 覆盖 `patches/0001`。
++- `poc/`（C 版 + Rust 版两个 PoC）验收通过后删除；其唯一未沉淀进本文的事实
++  （指针 ENTER/MOTION/LEAVE 输入路由日志、`wl_output.scale` 整数限制）
++  已记入 `docs/08-risk-analysis.md` 的 Go/No-Go 证据摘要与风险 #5 验证记录。
+diff --git a/cmake/build.cmake b/cmake/build.cmake
+index ad69502..a3c0cc0 100644
+--- a/cmake/build.cmake
++++ b/cmake/build.cmake
+@@ -68,6 +68,15 @@ else()
+     CODE_FILE "${_wayland_protocols_src_dir}/xdg-decoration-unstable-v1-protocol.c"
+     HEADER_FILE "${_wayland_protocols_src_dir}/xdg-decoration-unstable-v1-protocol.h")
+ 
++  # wlr-layer-shell is not shipped by wayland-protocols, so the XML is vendored
++  # under layer-shell/. PATCH_NS_KEYWORD works around the fact that
++  # wayland-scanner emits `const char *namespace`, a C++ keyword.
++  generate_wayland_client_protocol(
++    PATCH_NS_KEYWORD
++    PROTOCOL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/layer-shell/wlr-layer-shell-unstable-v1.xml"
++    CODE_FILE "${_wayland_protocols_src_dir}/wlr-layer-shell-unstable-v1-protocol.c"
++    HEADER_FILE "${_wayland_protocols_src_dir}/wlr-layer-shell-unstable-v1-client-protocol.h")
++
+   add_definitions(-DFLUTTER_TARGET_BACKEND_WAYLAND)
+   add_definitions(-DDISPLAY_BACKEND_TYPE_WAYLAND)
+   set(DISPLAY_BACKEND_SRC
+@@ -76,6 +85,7 @@ else()
+     "${_wayland_protocols_src_dir}/text-input-unstable-v3-protocol.c"
+     "${_wayland_protocols_src_dir}/presentation-time-protocol.c"
+     "${_wayland_protocols_src_dir}/xdg-decoration-unstable-v1-protocol.c"
++    "${_wayland_protocols_src_dir}/wlr-layer-shell-unstable-v1-protocol.c"
+     "src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc"
+     "src/flutter/shell/platform/linux_embedded/window/native_window_wayland.cc"
+     "src/flutter/shell/platform/linux_embedded/window/native_window_wayland_decoration.cc"
+diff --git a/cmake/generate_wayland_protocols.cmake b/cmake/generate_wayland_protocols.cmake
+index e320299..92885a4 100644
+--- a/cmake/generate_wayland_protocols.cmake
++++ b/cmake/generate_wayland_protocols.cmake
+@@ -1,7 +1,14 @@
+ cmake_minimum_required(VERSION 3.10)
+ 
++# Generates a wayland-scanner client header + private code pair.
++#
++# PATCH_NS_KEYWORD (optional):
++#   wayland-scanner names the last argument of wlr-layer-shell's
++#   get_layer_surface "namespace", which is a reserved keyword in C++. Because
++#   the generated header is included from C++ sources, rename the parameter to
++#   "ns" right after generation.
+ function(generate_wayland_client_protocol)
+-  cmake_parse_arguments(ARGS "" "PROTOCOL_FILE" "CODE_FILE;HEADER_FILE" ${ARGN})
++  cmake_parse_arguments(ARGS "PATCH_NS_KEYWORD" "PROTOCOL_FILE" "CODE_FILE;HEADER_FILE" ${ARGN})
+ 
+   find_program(WaylandScannerExec NAMES wayland-scanner)
+ 
+@@ -9,9 +16,21 @@ function(generate_wayland_client_protocol)
+   set_source_files_properties(${ARGS_HEADER_FILE} GENERATED)
+   set_source_files_properties(${ARGS_CODE_FILE} GENERATED)
+ 
++  # Keep this as a CMake list without ";" inside the sed expressions: every
++  # element of the list becomes one argv of the generated build rule.
++  set(_header_patch_commands "")
++  if(ARGS_PATCH_NS_KEYWORD)
++    set(_header_patch_commands
++      COMMAND sed -i
++              -e "s/\\*namespace)/\\*ns)/"
++              -e "s/, namespace)/, ns)/"
++              ${ARGS_HEADER_FILE})
++  endif()
++
+   add_custom_command(
+     OUTPUT ${ARGS_HEADER_FILE}
+     COMMAND ${WaylandScannerExec} client-header ${_xml_file} ${ARGS_HEADER_FILE}
++    ${_header_patch_commands}
+     DEPENDS ${_xml_file} VERBATIM
+   )
+ 
+diff --git a/examples/flutter-wayland-client/flutter_embedder_options.h b/examples/flutter-wayland-client/flutter_embedder_options.h
+index 41d0bd1..7751dfd 100644
+--- a/examples/flutter-wayland-client/flutter_embedder_options.h
++++ b/examples/flutter-wayland-client/flutter_embedder_options.h
+@@ -54,6 +54,26 @@ class FlutterEmbedderOptions {
+                              false);
+     options_.AddInt("width", "w", "Window width", 1280, false);
+     options_.AddInt("height", "h", "Window height", 720, false);
++    options_.AddWithoutValue(
++        "layer-shell", "l",
++        "Create a wlr-layer-shell surface instead of an xdg-shell window",
++        false);
++    options_.AddInt("layer", "L",
++                    "Layer-shell layer [0(background)|1(bottom)|2(top)|"
++                    "3(overlay)]",
++                    1, false);
++    options_.AddInt("anchor", "A",
++                    "Layer-shell anchor bitmask [top=1|bottom=2|left=4|"
++                    "right=8]",
++                    14, false);
++    options_.AddInt("exclusive-zone", "e",
++                    "Layer-shell exclusive zone in logical pixels", 48, false);
++    options_.AddString("layer-namespace", "N", "Layer-shell namespace",
++                       "flutter", false);
++    options_.AddInt("keyboard-interactive", "y",
++                    "Layer-shell keyboard interactivity "
++                    "[0(none)|1(exclusive)|2(on_demand)]",
++                    0, false);
+ #endif
+   }
+   ~FlutterEmbedderOptions() = default;
+@@ -127,6 +147,19 @@ class FlutterEmbedderOptions {
+             : flutter::FlutterViewController::ViewMode::kNormal;
+     window_width_ = options_.GetValue<int>("width");
+     window_height_ = options_.GetValue<int>("height");
++    if (options_.Exist("layer-shell")) {
++      window_view_mode_ =
++          flutter::FlutterViewController::ViewMode::kLayerShell;
++      // A layer surface is placed by the compositor, so window decorations
++      // would not make sense.
++      use_window_decoration_ = false;
++    }
++    layer_shell_layer_ = options_.GetValue<int>("layer");
++    layer_shell_anchor_ = options_.GetValue<int>("anchor");
++    layer_shell_exclusive_zone_ = options_.GetValue<int>("exclusive-zone");
++    layer_shell_namespace_ = options_.GetValue<std::string>("layer-namespace");
++    layer_shell_keyboard_interactivity_ =
++        options_.GetValue<int>("keyboard-interactive");
+ #endif
+ 
+     return true;
+@@ -177,6 +210,21 @@ class FlutterEmbedderOptions {
+   bool EnableVsync() const {
+     return enable_vsync_;
+   }
++  int LayerShellLayer() const {
++    return layer_shell_layer_;
++  }
++  unsigned int LayerShellAnchor() const {
++    return layer_shell_anchor_;
++  }
++  int LayerShellExclusiveZone() const {
++    return layer_shell_exclusive_zone_;
++  }
++  std::string LayerShellNamespace() const {
++    return layer_shell_namespace_;
++  }
++  unsigned int LayerShellKeyboardInteractivity() const {
++    return layer_shell_keyboard_interactivity_;
++  }
+ 
+  private:
+   commandline::CommandOptions options_;
+@@ -198,6 +246,11 @@ class FlutterEmbedderOptions {
+   double text_scale_factor_;
+   bool enable_high_contrast_;
+   bool enable_vsync_;
++  int layer_shell_layer_ = 1;
++  unsigned int layer_shell_anchor_ = 14;
++  int layer_shell_exclusive_zone_ = 48;
++  std::string layer_shell_namespace_ = "flutter";
++  unsigned int layer_shell_keyboard_interactivity_ = 0;
+ };
+ 
+ #endif  // FLUTTER_EMBEDDER_OPTIONS_
+diff --git a/examples/flutter-wayland-client/main.cc b/examples/flutter-wayland-client/main.cc
+index 579daee..64b36b1 100644
+--- a/examples/flutter-wayland-client/main.cc
++++ b/examples/flutter-wayland-client/main.cc
+@@ -40,6 +40,13 @@ int main(int argc, char** argv) {
+   view_properties.force_scale_factor = options.IsForceScaleFactor();
+   view_properties.scale_factor = options.ScaleFactor();
+   view_properties.enable_vsync = options.EnableVsync();
++  view_properties.layer_shell.layer = options.LayerShellLayer();
++  view_properties.layer_shell.anchor = options.LayerShellAnchor();
++  view_properties.layer_shell.exclusive_zone =
++      options.LayerShellExclusiveZone();
++  view_properties.layer_shell.layer_namespace = options.LayerShellNamespace();
++  view_properties.layer_shell.keyboard_interactivity =
++      options.LayerShellKeyboardInteractivity();
+ 
+   // The Flutter instance hosted by this window.
+   FlutterWindow window(view_properties, project);
+diff --git a/layer-shell/wlr-layer-shell-unstable-v1.xml b/layer-shell/wlr-layer-shell-unstable-v1.xml
+new file mode 100644
+index 0000000..e9f27e4
+--- /dev/null
++++ b/layer-shell/wlr-layer-shell-unstable-v1.xml
+@@ -0,0 +1,407 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="wlr_layer_shell_unstable_v1">
++  <copyright>
++    Copyright © 2017 Drew DeVault
++
++    Permission to use, copy, modify, distribute, and sell this
++    software and its documentation for any purpose is hereby granted
++    without fee, provided that the above copyright notice appear in
++    all copies and that both that copyright notice and this permission
++    notice appear in supporting documentation, and that the name of
++    the copyright holders not be used in advertising or publicity
++    pertaining to distribution of the software without specific,
++    written prior permission.  The copyright holders make no
++    representations about the suitability of this software for any
++    purpose.  It is provided "as is" without express or implied
++    warranty.
++
++    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
++    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
++    THIS SOFTWARE.
++  </copyright>
++
++  <interface name="zwlr_layer_shell_v1" version="5">
++    <description summary="create surfaces that are layers of the desktop">
++      Clients can use this interface to assign the surface_layer role to
++      wl_surfaces. Such surfaces are assigned to a "layer" of the output and
++      rendered with a defined z-depth respective to each other. They may also be
++      anchored to the edges and corners of a screen and specify input handling
++      semantics. This interface should be suitable for the implementation of
++      many desktop shell components, and a broad number of other applications
++      that interact with the desktop.
++    </description>
++
++    <request name="get_layer_surface">
++      <description summary="create a layer_surface from a surface">
++        Create a layer surface for an existing surface. This assigns the role of
++        layer_surface, or raises a protocol error if another role is already
++        assigned.
++
++        Creating a layer surface from a wl_surface which has a buffer attached
++        or committed is a client error, and any attempts by a client to attach
++        or manipulate a buffer prior to the first layer_surface.configure call
++        must also be treated as errors.
++
++        After creating a layer_surface object and setting it up, the client
++        must perform an initial commit without any buffer attached.
++        The compositor will reply with a layer_surface.configure event.
++        The client must acknowledge it and is then allowed to attach a buffer
++        to map the surface.
++
++        You may pass NULL for output to allow the compositor to decide which
++        output to use. Generally this will be the one that the user most
++        recently interacted with.
++
++        Clients can specify a namespace that defines the purpose of the layer
++        surface.
++      </description>
++      <arg name="id" type="new_id" interface="zwlr_layer_surface_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++      <arg name="output" type="object" interface="wl_output" allow-null="true"/>
++      <arg name="layer" type="uint" enum="layer" summary="layer to add this surface to"/>
++      <arg name="namespace" type="string" summary="namespace for the layer surface"/>
++    </request>
++
++    <enum name="error">
++      <entry name="role" value="0" summary="wl_surface has another role"/>
++      <entry name="invalid_layer" value="1" summary="layer value is invalid"/>
++      <entry name="already_constructed" value="2" summary="wl_surface has a buffer attached or committed"/>
++    </enum>
++
++    <enum name="layer">
++      <description summary="available layers for surfaces">
++        These values indicate which layers a surface can be rendered in. They
++        are ordered by z depth, bottom-most first. Traditional shell surfaces
++        will typically be rendered between the bottom and top layers.
++        Fullscreen shell surfaces are typically rendered at the top layer.
++        Multiple surfaces can share a single layer, and ordering within a
++        single layer is undefined.
++      </description>
++
++      <entry name="background" value="0"/>
++      <entry name="bottom" value="1"/>
++      <entry name="top" value="2"/>
++      <entry name="overlay" value="3"/>
++    </enum>
++
++    <!-- Version 3 additions -->
++
++    <request name="destroy" type="destructor" since="3">
++      <description summary="destroy the layer_shell object">
++        This request indicates that the client will not use the layer_shell
++        object any more. Objects that have been created through this instance
++        are not affected.
++      </description>
++    </request>
++  </interface>
++
++  <interface name="zwlr_layer_surface_v1" version="5">
++    <description summary="layer metadata interface">
++      An interface that may be implemented by a wl_surface, for surfaces that
++      are designed to be rendered as a layer of a stacked desktop-like
++      environment.
++
++      Layer surface state (layer, size, anchor, exclusive zone,
++      margin, interactivity) is double-buffered, and will be applied at the
++      time wl_surface.commit of the corresponding wl_surface is called.
++
++      Attaching a null buffer to a layer surface unmaps it.
++
++      Unmapping a layer_surface means that the surface cannot be shown by the
++      compositor until it is explicitly mapped again. The layer_surface
++      returns to the state it had right after layer_shell.get_layer_surface.
++      The client can re-map the surface by performing a commit without any
++      buffer attached, waiting for a configure event and handling it as usual.
++    </description>
++
++    <request name="set_size">
++      <description summary="sets the size of the surface">
++        Sets the size of the surface in surface-local coordinates. The
++        compositor will display the surface centered with respect to its
++        anchors.
++
++        If you pass 0 for either value, the compositor will assign it and
++        inform you of the assignment in the configure event. You must set your
++        anchor to opposite edges in the dimensions you omit; not doing so is a
++        protocol error. Both values are 0 by default.
++
++        Size is double-buffered, see wl_surface.commit.
++      </description>
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </request>
++
++    <request name="set_anchor">
++      <description summary="configures the anchor point of the surface">
++        Requests that the compositor anchor the surface to the specified edges
++        and corners. If two orthogonal edges are specified (e.g. 'top' and
++        'left'), then the anchor point will be the intersection of the edges
++        (e.g. the top left corner of the output); otherwise the anchor point
++        will be centered on that edge, or in the center if none is specified.
++
++        Anchor is double-buffered, see wl_surface.commit.
++      </description>
++      <arg name="anchor" type="uint" enum="anchor"/>
++    </request>
++
++    <request name="set_exclusive_zone">
++      <description summary="configures the exclusive geometry of this surface">
++        Requests that the compositor avoids occluding an area with other
++        surfaces. The compositor's use of this information is
++        implementation-dependent - do not assume that this region will not
++        actually be occluded.
++
++        A positive value is only meaningful if the surface is anchored to one
++        edge or an edge and both perpendicular edges. If the surface is not
++        anchored, anchored to only two perpendicular edges (a corner), anchored
++        to only two parallel edges or anchored to all edges, a positive value
++        will be treated the same as zero.
++
++        A positive zone is the distance from the edge in surface-local
++        coordinates to consider exclusive.
++
++        Surfaces that do not wish to have an exclusive zone may instead specify
++        how they should interact with surfaces that do. If set to zero, the
++        surface indicates that it would like to be moved to avoid occluding
++        surfaces with a positive exclusive zone. If set to -1, the surface
++        indicates that it would not like to be moved to accommodate for other
++        surfaces, and the compositor should extend it all the way to the edges
++        it is anchored to.
++
++        For example, a panel might set its exclusive zone to 10, so that
++        maximized shell surfaces are not shown on top of it. A notification
++        might set its exclusive zone to 0, so that it is moved to avoid
++        occluding the panel, but shell surfaces are shown underneath it. A
++        wallpaper or lock screen might set their exclusive zone to -1, so that
++        they stretch below or over the panel.
++
++        The default value is 0.
++
++        Exclusive zone is double-buffered, see wl_surface.commit.
++      </description>
++      <arg name="zone" type="int"/>
++    </request>
++
++    <request name="set_margin">
++      <description summary="sets a margin from the anchor point">
++        Requests that the surface be placed some distance away from the anchor
++        point on the output, in surface-local coordinates. Setting this value
++        for edges you are not anchored to has no effect.
++
++        The exclusive zone includes the margin.
++
++        Margin is double-buffered, see wl_surface.commit.
++      </description>
++      <arg name="top" type="int"/>
++      <arg name="right" type="int"/>
++      <arg name="bottom" type="int"/>
++      <arg name="left" type="int"/>
++    </request>
++
++    <enum name="keyboard_interactivity">
++      <description summary="types of keyboard interaction possible for a layer shell surface">
++        Types of keyboard interaction possible for layer shell surfaces. The
++        rationale for this is twofold: (1) some applications are not interested
++        in keyboard events and not allowing them to be focused can improve the
++        desktop experience; (2) some applications will want to take exclusive
++        keyboard focus.
++      </description>
++
++      <entry name="none" value="0">
++        <description summary="no keyboard focus is possible">
++          This value indicates that this surface is not interested in keyboard
++          events and the compositor should never assign it the keyboard focus.
++
++          This is the default value, set for newly created layer shell surfaces.
++
++          This is useful for e.g. desktop widgets that display information or
++          only have interaction with non-keyboard input devices.
++        </description>
++      </entry>
++      <entry name="exclusive" value="1">
++        <description summary="request exclusive keyboard focus">
++          Request exclusive keyboard focus if this surface is above the shell surface layer.
++
++          For the top and overlay layers, the seat will always give
++          exclusive keyboard focus to the top-most layer which has keyboard
++          interactivity set to exclusive. If this layer contains multiple
++          surfaces with keyboard interactivity set to exclusive, the compositor
++          determines the one receiving keyboard events in an implementation-
++          defined manner. In this case, no guarantee is made when this surface
++          will receive keyboard focus (if ever).
++
++          For the bottom and background layers, the compositor is allowed to use
++          normal focus semantics.
++
++          This setting is mainly intended for applications that need to ensure
++          they receive all keyboard events, such as a lock screen or a password
++          prompt.
++        </description>
++      </entry>
++      <entry name="on_demand" value="2" since="4">
++        <description summary="request regular keyboard focus semantics">
++          This requests the compositor to allow this surface to be focused and
++          unfocused by the user in an implementation-defined manner. The user
++          should be able to unfocus this surface even regardless of the layer
++          it is on.
++
++          Typically, the compositor will want to use its normal mechanism to
++          manage keyboard focus between layer shell surfaces with this setting
++          and regular toplevels on the desktop layer (e.g. click to focus).
++          Nevertheless, it is possible for a compositor to require a special
++          interaction to focus or unfocus layer shell surfaces (e.g. requiring
++          a click even if focus follows the mouse normally, or providing a
++          keybinding to switch focus between layers).
++
++          This setting is mainly intended for desktop shell components (e.g.
++          panels) that allow keyboard interaction. Using this option can allow
++          implementing a desktop shell that can be fully usable without the
++          mouse.
++        </description>
++      </entry>
++    </enum>
++
++    <request name="set_keyboard_interactivity">
++      <description summary="requests keyboard events">
++        Set how keyboard events are delivered to this surface. By default,
++        layer shell surfaces do not receive keyboard events; this request can
++        be used to change this.
++
++        This setting is inherited by child surfaces set by the get_popup
++        request.
++
++        Layer surfaces receive pointer, touch, and tablet events normally. If
++        you do not want to receive them, set the input region on your surface
++        to an empty region.
++
++        Keyboard interactivity is double-buffered, see wl_surface.commit.
++      </description>
++      <arg name="keyboard_interactivity" type="uint" enum="keyboard_interactivity"/>
++    </request>
++
++    <request name="get_popup">
++      <description summary="assign this layer_surface as an xdg_popup parent">
++        This assigns an xdg_popup's parent to this layer_surface.  This popup
++        should have been created via xdg_surface::get_popup with the parent set
++        to NULL, and this request must be invoked before committing the popup's
++        initial state.
++
++        See the documentation of xdg_popup for more details about what an
++        xdg_popup is and how it is used.
++      </description>
++      <arg name="popup" type="object" interface="xdg_popup"/>
++    </request>
++
++    <request name="ack_configure">
++      <description summary="ack a configure event">
++        When a configure event is received, if a client commits the
++        surface in response to the configure event, then the client
++        must make an ack_configure request sometime before the commit
++        request, passing along the serial of the configure event.
++
++        If the client receives multiple configure events before it
++        can respond to one, it only has to ack the last configure event.
++
++        A client is not required to commit immediately after sending
++        an ack_configure request - it may even ack_configure several times
++        before its next surface commit.
++
++        A client may send multiple ack_configure requests before committing, but
++        only the last request sent before a commit indicates which configure
++        event the client really is responding to.
++      </description>
++      <arg name="serial" type="uint" summary="the serial from the configure event"/>
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the layer_surface">
++        This request destroys the layer surface.
++      </description>
++    </request>
++
++    <event name="configure">
++      <description summary="suggest a surface change">
++        The configure event asks the client to resize its surface.
++
++        Clients should arrange their surface for the new states, and then send
++        an ack_configure request with the serial sent in this configure event at
++        some point before committing the new surface.
++
++        The client is free to dismiss all but the last configure event it
++        received.
++
++        The width and height arguments specify the size of the window in
++        surface-local coordinates.
++
++        The size is a hint, in the sense that the client is free to ignore it if
++        it doesn't resize, pick a smaller size (to satisfy aspect ratio or
++        resize in steps of NxM pixels). If the client picks a smaller size and
++        is anchored to two opposite anchors (e.g. 'top' and 'bottom'), the
++        surface will be centered on this axis.
++
++        If the width or height arguments are zero, it means the client should
++        decide its own window dimension.
++      </description>
++      <arg name="serial" type="uint"/>
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </event>
++
++    <event name="closed">
++      <description summary="surface should be closed">
++        The closed event is sent by the compositor when the surface will no
++        longer be shown. The output may have been destroyed or the user may
++        have asked for it to be removed. Further changes to the surface will be
++        ignored. The client should destroy the resource after receiving this
++        event, and create a new surface if they so choose.
++      </description>
++    </event>
++
++    <enum name="error">
++      <entry name="invalid_surface_state" value="0" summary="provided surface state is invalid"/>
++      <entry name="invalid_size" value="1" summary="size is invalid"/>
++      <entry name="invalid_anchor" value="2" summary="anchor bitfield is invalid"/>
++      <entry name="invalid_keyboard_interactivity" value="3" summary="keyboard interactivity is invalid"/>
++      <entry name="invalid_exclusive_edge" value="4" summary="exclusive edge is invalid given the surface anchors"/>
++    </enum>
++
++    <enum name="anchor" bitfield="true">
++      <entry name="top" value="1" summary="the top edge of the anchor rectangle"/>
++      <entry name="bottom" value="2" summary="the bottom edge of the anchor rectangle"/>
++      <entry name="left" value="4" summary="the left edge of the anchor rectangle"/>
++      <entry name="right" value="8" summary="the right edge of the anchor rectangle"/>
++    </enum>
++
++    <!-- Version 2 additions -->
++
++    <request name="set_layer" since="2">
++      <description summary="change the layer of the surface">
++        Change the layer that the surface is rendered on.
++
++        Layer is double-buffered, see wl_surface.commit.
++      </description>
++      <arg name="layer" type="uint" enum="zwlr_layer_shell_v1.layer" summary="layer to move this surface to"/>
++    </request>
++
++    <!-- Version 5 additions -->
++
++    <request name="set_exclusive_edge" since="5">
++      <description summary="set the edge the exclusive zone will be applied to">
++        Requests an edge for the exclusive zone to apply. The exclusive
++        edge will be automatically deduced from anchor points when possible,
++        but when the surface is anchored to a corner, it will be necessary
++        to set it explicitly to disambiguate, as it is not possible to deduce
++        which one of the two corner edges should be used.
++
++        The edge must be one the surface is anchored to, otherwise the
++        invalid_exclusive_edge protocol error will be raised.
++      </description>
++      <arg name="edge" type="uint" enum="anchor"/>
++    </request>
++  </interface>
++</protocol>
+diff --git a/src/client_wrapper/flutter_view_controller.cc b/src/client_wrapper/flutter_view_controller.cc
+index 47f8152..41bd957 100644
+--- a/src/client_wrapper/flutter_view_controller.cc
++++ b/src/client_wrapper/flutter_view_controller.cc
+@@ -28,6 +28,8 @@ FlutterViewController::FlutterViewController(
+   c_view_properties.view_mode =
+       (view_properties.view_mode == ViewMode::kFullscreen)
+           ? FlutterDesktopViewMode::kFullscreen
++      : (view_properties.view_mode == ViewMode::kLayerShell)
++          ? FlutterDesktopViewMode::kLayerShell
+           : FlutterDesktopViewMode::kNormalscreen;
+   c_view_properties.title = view_properties.title.has_value()
+                                 ? (*view_properties.title).c_str()
+@@ -45,6 +47,18 @@ FlutterViewController::FlutterViewController(
+   c_view_properties.force_scale_factor = view_properties.force_scale_factor;
+   c_view_properties.scale_factor = view_properties.scale_factor;
+   c_view_properties.enable_vsync = view_properties.enable_vsync;
++  c_view_properties.layer_shell.layer =
++      static_cast<FlutterDesktopLayerShellLayer>(
++          view_properties.layer_shell.layer);
++  c_view_properties.layer_shell.anchor = view_properties.layer_shell.anchor;
++  c_view_properties.layer_shell.exclusive_zone =
++      view_properties.layer_shell.exclusive_zone;
++  c_view_properties.layer_shell.layer_namespace =
++      view_properties.layer_shell.layer_namespace.has_value()
++          ? (*view_properties.layer_shell.layer_namespace).c_str()
++          : nullptr;
++  c_view_properties.layer_shell.keyboard_interactivity =
++      view_properties.layer_shell.keyboard_interactivity;
+ 
+   controller_ = FlutterDesktopViewControllerCreate(&c_view_properties,
+                                                    engine_->RelinquishEngine());
+diff --git a/src/client_wrapper/include/flutter/flutter_view_controller.h b/src/client_wrapper/include/flutter/flutter_view_controller.h
+index 2abf0e6..525c917 100644
+--- a/src/client_wrapper/include/flutter/flutter_view_controller.h
++++ b/src/client_wrapper/include/flutter/flutter_view_controller.h
+@@ -31,6 +31,8 @@ class FlutterViewController {
+     kNormal = 0,
+     // Shows always the Flutter view by fullscreen.
+     kFullscreen = 1,
++    // Shows the Flutter view as a wlr-layer-shell surface (Wayland only).
++    kLayerShell = 2,
+   };
+ 
+   enum ViewRotation {
+@@ -44,6 +46,22 @@ class FlutterViewController {
+     kRotation_270 = 3,
+   };
+ 
++  // Properties for configuring a wlr-layer-shell surface.
++  // Only used when ViewProperties::view_mode is ViewMode::kLayerShell.
++  typedef struct LayerShellProperties {
++    // wlr-layer-shell layer: 0=background, 1=bottom, 2=top, 3=overlay.
++    int layer = 1;
++    // Anchor bitmask: top=1, bottom=2, left=4, right=8.
++    unsigned int anchor = 14;
++    // Reserved space in logical pixels (0 = allow overlap, <0 = ignore other
++    // surfaces' exclusive zones).
++    int exclusive_zone = 48;
++    // Namespace of the layer surface. Unset means "flutter".
++    std::optional<std::string> layer_namespace;
++    // Keyboard focus: 0=none, 1=exclusive, 2=on_demand.
++    unsigned int keyboard_interactivity = 0;
++  } LayerShellProperties;
++
+   // Properties for configuring a Flutter view instance.
+   typedef struct {
+     // View width.
+@@ -90,6 +108,9 @@ class FlutterViewController {
+     // True:  Sync to compositor redraw/v-blank  (eglSwapInterval 1)
+     // False: Do not sync to compositor redraw/v-blank (eglSwapInterval 0)
+     bool enable_vsync;
++
++    // wlr-layer-shell configuration. Only read when view_mode is kLayerShell.
++    LayerShellProperties layer_shell;
+   } ViewProperties;
+ 
+   // Creates a FlutterView that can be parented into a Windows View hierarchy
+diff --git a/src/flutter/shell/platform/common/client_wrapper/core_implementations.cc b/src/flutter/shell/platform/common/client_wrapper/core_implementations.cc
+index ec0d6dd..ecc3997 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/core_implementations.cc
++++ b/src/flutter/shell/platform/common/client_wrapper/core_implementations.cc
+@@ -14,6 +14,7 @@
+ // manually include files.
+ 
+ #include <cassert>
++#include <cstdint>
+ #include <iostream>
+ #include <variant>
+ 
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/basic_message_channel.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/basic_message_channel.h
+index c081946..d47e539 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/basic_message_channel.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/basic_message_channel.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_BASIC_MESSAGE_CHANNEL_H_
+ 
+ #include <iostream>
++#include <cstdint>
+ #include <string>
+ 
+ #include "binary_messenger.h"
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/binary_messenger.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/binary_messenger.h
+index d552b49..b88c19d 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/binary_messenger.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/binary_messenger.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_BINARY_MESSENGER_H_
+ 
+ #include <functional>
++#include <cstdint>
+ #include <string>
+ 
+ namespace flutter {
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/byte_streams.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/byte_streams.h
+index 3360bab..99d5f8b 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/byte_streams.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/byte_streams.h
+@@ -7,6 +7,8 @@
+ 
+ // Interfaces for interacting with a stream of bytes, for use in codecs.
+ 
++#include <cstdint>
++
+ namespace flutter {
+ 
+ // An interface for a class that reads from a byte stream.
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/engine_method_result.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/engine_method_result.h
+index 3cc8b6a..b958665 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/engine_method_result.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/engine_method_result.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_ENGINE_METHOD_RESULT_H_
+ 
+ #include <memory>
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/event_channel.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/event_channel.h
+index c96e640..b545175 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/event_channel.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/event_channel.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_EVENT_CHANNEL_H_
+ 
+ #include <iostream>
++#include <cstdint>
+ #include <memory>
+ #include <string>
+ 
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/message_codec.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/message_codec.h
+index c84d25f..991687b 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/message_codec.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/message_codec.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_MESSAGE_CODEC_H_
+ 
+ #include <memory>
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_channel.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_channel.h
+index 6e39a64..d6ca5d8 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_channel.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_channel.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_METHOD_CHANNEL_H_
+ 
+ #include <iostream>
++#include <cstdint>
+ #include <string>
+ 
+ #include "binary_messenger.h"
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_codec.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_codec.h
+index b40fa64..e689154 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_codec.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/method_codec.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_METHOD_CODEC_H_
+ 
+ #include <memory>
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_codec_serializer.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_codec_serializer.h
+index a600103..ae592d3 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_codec_serializer.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_codec_serializer.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_STANDARD_CODEC_SERIALIZER_H_
+ 
+ #include "byte_streams.h"
++#include <cstdint>
+ #include "encodable_value.h"
+ 
+ namespace flutter {
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_message_codec.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_message_codec.h
+index 568b391..6e20432 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_message_codec.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_message_codec.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_STANDARD_MESSAGE_CODEC_H_
+ 
+ #include <memory>
++#include <cstdint>
+ 
+ #include "encodable_value.h"
+ #include "message_codec.h"
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_method_codec.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_method_codec.h
+index b6db35e..64330ec 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_method_codec.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/standard_method_codec.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_STANDARD_METHOD_CODEC_H_
+ 
+ #include <memory>
++#include <cstdint>
+ 
+ #include "encodable_value.h"
+ #include "method_call.h"
+diff --git a/src/flutter/shell/platform/common/client_wrapper/include/flutter/string_message_codec.h b/src/flutter/shell/platform/common/client_wrapper/include/flutter/string_message_codec.h
+index 11f31d4..ab25c39 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/include/flutter/string_message_codec.h
++++ b/src/flutter/shell/platform/common/client_wrapper/include/flutter/string_message_codec.h
+@@ -6,6 +6,7 @@
+ #define __CODE_FLUTTER_EMBEDDED_LINUX_SRC_FLUTTER_SHELL_PLATFORM_COMMON_CLIENT_WRAPPER_INCLUDE_FLUTTER_STRING_MESSAGE_CODEC_H_
+ 
+ #include "message_codec.h"
++#include <cstdint>
+ 
+ namespace flutter {
+ 
+diff --git a/src/flutter/shell/platform/common/client_wrapper/standard_codec.cc b/src/flutter/shell/platform/common/client_wrapper/standard_codec.cc
+index 5e93d40..a0e48b0 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/standard_codec.cc
++++ b/src/flutter/shell/platform/common/client_wrapper/standard_codec.cc
+@@ -8,6 +8,7 @@
+ // that any client that needs one of these files needs all three.
+ 
+ #include <cassert>
++#include <cstdint>
+ #include <cstring>
+ #include <iostream>
+ #include <map>
+diff --git a/src/flutter/shell/platform/common/client_wrapper/string_message_codec.cc b/src/flutter/shell/platform/common/client_wrapper/string_message_codec.cc
+index d0c12ba..becdaa9 100644
+--- a/src/flutter/shell/platform/common/client_wrapper/string_message_codec.cc
++++ b/src/flutter/shell/platform/common/client_wrapper/string_message_codec.cc
+@@ -5,6 +5,7 @@
+ #include "include/flutter/string_message_codec.h"
+ 
+ #include <string>
++#include <cstdint>
+ 
+ namespace flutter {
+ 
+diff --git a/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h b/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h
+index eacb526..dbfa683 100644
+--- a/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h
++++ b/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h
+@@ -60,8 +60,65 @@ enum FlutterDesktopViewMode {
+   kNormalscreen = 0,
+   // Shows always the Flutter view by fullscreen.
+   kFullscreen = 1,
++  // Shows the Flutter view as a wlr-layer-shell surface (panel/overlay) instead
++  // of an xdg-shell window. Wayland backend only. The final geometry is
++  // decided by the compositor and reported back through the layer surface
++  // configure event, which updates `width`/`height`.
++  kLayerShell = 2,
+ };
+ 
++// The wlr-layer-shell layer a layer surface is rendered on.
++enum FlutterDesktopLayerShellLayer {
++  kLayerBackground = 0,
++  kLayerBottom = 1,
++  kLayerTop = 2,
++  kLayerOverlay = 3,
++};
++
++// Anchor bits of a layer surface. They can be ORed together, e.g.
++// (kAnchorBottom | kAnchorLeft | kAnchorRight) for a bottom panel spanning the
++// whole output width.
++enum FlutterDesktopLayerShellAnchor {
++  kAnchorNone = 0,
++  kAnchorTop = 1,
++  kAnchorBottom = 2,
++  kAnchorLeft = 4,
++  kAnchorRight = 8,
++};
++
++// Keyboard focus policy of a layer surface.
++enum FlutterDesktopLayerShellKeyboardInteractivity {
++  kKeyboardInteractivityNone = 0,
++  kKeyboardInteractivityExclusive = 1,
++  // Available since wlr-layer-shell v4.
++  kKeyboardInteractivityOnDemand = 2,
++};
++
++// Properties for configuring a wlr-layer-shell surface.
++// Only used when `view_mode` is kLayerShell.
++typedef struct {
++  // The layer the surface is rendered on.
++  FlutterDesktopLayerShellLayer layer;
++
++  // Anchor bitmask, see FlutterDesktopLayerShellAnchor. Width/height components
++  // that are anchored on both sides should be set to 0 to let the compositor
++  // stretch the surface.
++  uint32_t anchor;
++
++  // Space (in logical pixels) reserved on the output so that other surfaces do
++  // not overlap this one. Use 0 to allow overlap and a negative value to ask
++  // the compositor to ignore other surfaces' exclusive zones.
++  int32_t exclusive_zone;
++
++  // Namespace of the layer surface. This is the `namespace` argument of
++  // wlr-layer-shell's get_layer_surface request. It may be NULL, in which case
++  // "flutter" is used.
++  const char* layer_namespace;
++
++  // Keyboard focus policy, see FlutterDesktopLayerShellKeyboardInteractivity.
++  uint32_t keyboard_interactivity;
++} FlutterDesktopLayerShellProperties;
++
+ // The View rotation setting.
+ enum FlutterDesktopViewRotation {
+   // Rotation constant: 0 degree rotation (natural orientation)
+@@ -86,7 +143,9 @@ typedef struct {
+   FlutterDesktopViewRotation view_rotation;
+ 
+   // View display mode. If you set kFullscreen, the parameters of both `width`
+-  // and `height` will be ignored.
++  // and `height` will be ignored. If you set kLayerShell they are used as the
++  // requested size (0 = let the compositor decide) and are overwritten by the
++  // size the compositor actually grants.
+   FlutterDesktopViewMode view_mode;
+ 
+   // View title.
+@@ -120,6 +179,9 @@ typedef struct {
+   // True:  Sync to compositor redraw/v-blank  (eglSwapInterval 1)
+   // False: Do not sync to compositor redraw/v-blank (eglSwapInterval 0)
+   bool enable_vsync;
++
++  // wlr-layer-shell configuration. Only read when `view_mode` is kLayerShell.
++  FlutterDesktopLayerShellProperties layer_shell;
+ } FlutterDesktopViewProperties;
+ 
+ // ========== View Controller ==========
+diff --git a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
+index 6467bf9..8a77300 100644
+--- a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
++++ b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
+@@ -687,7 +687,11 @@ const wl_output_listener ELinuxWindowWayland::kWlOutputListener = {
+           self->request_redraw_ = true;
+         }
+ 
+-        if (self->view_properties_.width > width) {
++        // A layer surface's geometry is granted by the compositor, so never
++        // clip it down to the output size here.
++        if (self->view_properties_.view_mode !=
++                FlutterDesktopViewMode::kLayerShell &&
++            self->view_properties_.width > width) {
+           ELINUX_LOG(WARNING)
+               << "Requested width size(" << self->view_properties_.width << ") "
+               << "is larger than display size(" << width
+@@ -696,7 +700,9 @@ const wl_output_listener ELinuxWindowWayland::kWlOutputListener = {
+           self->view_properties_.width = width;
+           self->request_redraw_ = true;
+         }
+-        if (self->view_properties_.height > height) {
++        if (self->view_properties_.view_mode !=
++                FlutterDesktopViewMode::kLayerShell &&
++            self->view_properties_.height > height) {
+           ELINUX_LOG(WARNING)
+               << "Requested height size(" << self->view_properties_.height
+               << ") " << "is larger than display size(" << height
+@@ -1050,6 +1056,49 @@ const zxdg_toplevel_decoration_v1_listener
+         },
+ };
+ 
++const zwlr_layer_surface_v1_listener
++    ELinuxWindowWayland::kZwlrLayerSurfaceV1Listener = {
++        .configure =
++            [](void* data,
++               zwlr_layer_surface_v1* layer_surface,
++               uint32_t serial,
++               uint32_t width,
++               uint32_t height) {
++          ELINUX_LOG(INFO) << "zwlr_layer_surface_v1_listener.configure: "
++                           << width << "x" << height;
++
++          auto self = reinterpret_cast<ELinuxWindowWayland*>(data);
++          // The surface must be acknowledged before it can be given a buffer.
++          zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
++
++          // A zero dimension means the compositor kept the requested size.
++          if (width > 0 && height > 0) {
++            const int32_t next_width = static_cast<int32_t>(width);
++            const int32_t next_height = static_cast<int32_t>(height);
++            if (self->view_properties_.width != next_width ||
++                self->view_properties_.height != next_height) {
++              ELINUX_LOG(INFO) << "layer surface resized to " << next_width
++                               << "x" << next_height;
++              self->view_properties_.width = next_width;
++              self->view_properties_.height = next_height;
++            }
++          }
++
++          self->layer_surface_configured_ = true;
++          if (self->wait_for_configure_) {
++            self->wait_for_configure_ = false;
++          }
++          self->request_redraw_ = true;
++        },
++        .closed =
++            [](void* data, zwlr_layer_surface_v1* layer_surface) {
++          ELINUX_LOG(INFO) << "zwlr_layer_surface_v1_listener.closed";
++
++          auto self = reinterpret_cast<ELinuxWindowWayland*>(data);
++          self->running_ = false;
++        },
++};
++
+ ELinuxWindowWayland::ELinuxWindowWayland(
+     FlutterDesktopViewProperties view_properties)
+     : cursor_info_({"", 0, nullptr}),
+@@ -1183,6 +1232,26 @@ ELinuxWindowWayland::~ELinuxWindowWayland() {
+     }
+   }
+ 
++  {
++    if (zwlr_layer_surface_v1_) {
++      zwlr_layer_surface_v1_destroy(zwlr_layer_surface_v1_);
++      zwlr_layer_surface_v1_ = nullptr;
++      layer_surface_configured_ = false;
++    }
++
++    if (zwlr_layer_shell_v1_) {
++      // zwlr_layer_shell_v1.destroy is only available since version 3, so fall
++      // back to destroying the proxy itself on older compositors.
++      if (wl_proxy_get_version(
++              reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_)) >= 3) {
++        zwlr_layer_shell_v1_destroy(zwlr_layer_shell_v1_);
++      } else {
++        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_));
++      }
++      zwlr_layer_shell_v1_ = nullptr;
++    }
++  }
++
+   if (wl_data_offer_) {
+     wl_data_offer_destroy(wl_data_offer_);
+     wl_data_offer_ = nullptr;
+@@ -1376,7 +1445,15 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+     return false;
+   }
+ 
+-  if (!xdg_wm_base_) {
++  const bool layer_shell_mode =
++      view_properties_.view_mode == FlutterDesktopViewMode::kLayerShell;
++
++  if (layer_shell_mode) {
++    if (!zwlr_layer_shell_v1_) {
++      ELINUX_LOG(ERROR) << "The compositor does not support wlr-layer-shell.";
++      return false;
++    }
++  } else if (!xdg_wm_base_) {
+     ELINUX_LOG(ERROR) << "Xdg-shell is invalid";
+     return false;
+   }
+@@ -1386,6 +1463,23 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+     height_px = view_properties_.height * current_scale_;
+   }
+ 
++  if (layer_shell_mode) {
++    // wl_egl_window_create cannot express "let the compositor decide" (a
++    // requested width of 0 stretches the surface between its left and right
++    // anchors), so the window only needs a placeholder size here. The blocking
++    // configure below grants the real geometry, and OnWindowSizeChanged resizes
++    // the EGL window from it.
++    // display_max_width_/height_ come from wl_output.mode and are therefore
++    // physical pixels: they must not be multiplied by the scale again.
++    if (view_properties_.width > 0 && view_properties_.height > 0) {
++      width_px = view_properties_.width * current_scale_;
++      height_px = view_properties_.height * current_scale_;
++    } else {
++      width_px = display_max_width_ > 0 ? display_max_width_ : 1280;
++      height_px = display_max_height_ > 0 ? display_max_height_ : 720;
++    }
++  }
++
+   ELINUX_LOG(TRACE) << "Created the Wayland surface: " << width_px << "x"
+                     << height_px;
+   if (view_properties_.use_mouse_cursor) {
+@@ -1405,22 +1499,57 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+ 
+   wl_surface_add_listener(native_window_->Surface(), &kWlSurfaceListener, this);
+ 
+-  xdg_surface_ =
+-      xdg_wm_base_get_xdg_surface(xdg_wm_base_, native_window_->Surface());
+-  if (!xdg_surface_) {
+-    ELINUX_LOG(ERROR) << "Failed to get the xdg surface.";
+-    return false;
+-  }
+-  xdg_surface_add_listener(xdg_surface_, &kXdgSurfaceListener, this);
++  if (layer_shell_mode) {
++    const auto& ls_properties = view_properties_.layer_shell;
++    zwlr_layer_surface_v1_ = zwlr_layer_shell_v1_get_layer_surface(
++        zwlr_layer_shell_v1_, native_window_->Surface(), nullptr,
++        static_cast<uint32_t>(ls_properties.layer),
++        ls_properties.layer_namespace ? ls_properties.layer_namespace
++                                      : "flutter");
++    if (!zwlr_layer_surface_v1_) {
++      ELINUX_LOG(ERROR) << "Failed to get the layer surface.";
++      return false;
++    }
++    zwlr_layer_surface_v1_add_listener(zwlr_layer_surface_v1_,
++                                       &kZwlrLayerSurfaceV1Listener, this);
++    zwlr_layer_surface_v1_set_size(
++        zwlr_layer_surface_v1_,
++        view_properties_.width > 0 ? view_properties_.width : 0,
++        view_properties_.height > 0 ? view_properties_.height : 0);
++    zwlr_layer_surface_v1_set_anchor(zwlr_layer_surface_v1_,
++                                     ls_properties.anchor);
++    zwlr_layer_surface_v1_set_exclusive_zone(zwlr_layer_surface_v1_,
++                                             ls_properties.exclusive_zone);
++    zwlr_layer_surface_v1_set_keyboard_interactivity(
++        zwlr_layer_surface_v1_, ls_properties.keyboard_interactivity);
++    ELINUX_LOG(INFO) << "Created the layer surface: layer="
++                     << static_cast<uint32_t>(ls_properties.layer)
++                     << ", anchor=" << ls_properties.anchor
++                     << ", exclusive_zone=" << ls_properties.exclusive_zone
++                     << ", keyboard_interactivity="
++                     << ls_properties.keyboard_interactivity;
++  } else {
++    xdg_surface_ =
++        xdg_wm_base_get_xdg_surface(xdg_wm_base_, native_window_->Surface());
++    if (!xdg_surface_) {
++      ELINUX_LOG(ERROR) << "Failed to get the xdg surface.";
++      return false;
++    }
++    xdg_surface_add_listener(xdg_surface_, &kXdgSurfaceListener, this);
+ 
+-  xdg_toplevel_ = xdg_surface_get_toplevel(xdg_surface_);
+-  if (view_properties_.title != nullptr) {
+-    xdg_toplevel_set_title(xdg_toplevel_, view_properties_.title);
+-  }
+-  if (view_properties_.app_id != nullptr) {
+-    xdg_toplevel_set_app_id(xdg_toplevel_, view_properties_.app_id);
++    xdg_toplevel_ = xdg_surface_get_toplevel(xdg_surface_);
++    if (view_properties_.title != nullptr) {
++      xdg_toplevel_set_title(xdg_toplevel_, view_properties_.title);
++    }
++    if (view_properties_.app_id != nullptr) {
++      xdg_toplevel_set_app_id(xdg_toplevel_, view_properties_.app_id);
++    }
++    xdg_toplevel_add_listener(xdg_toplevel_, &kXdgToplevelListener, this);
++
++    if (view_properties_.view_mode == FlutterDesktopViewMode::kFullscreen) {
++      xdg_toplevel_set_fullscreen(xdg_toplevel_, NULL);
++    }
+   }
+-  xdg_toplevel_add_listener(xdg_toplevel_, &kXdgToplevelListener, this);
+   wl_surface_set_buffer_scale(native_window_->Surface(), current_scale_);
+ 
+   {
+@@ -1435,10 +1564,6 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+     }
+   }
+ 
+-  if (view_properties_.view_mode == FlutterDesktopViewMode::kFullscreen) {
+-    xdg_toplevel_set_fullscreen(xdg_toplevel_, NULL);
+-  }
+-
+   wait_for_configure_ = true;
+   wl_surface_commit(native_window_->Surface());
+ 
+@@ -1446,7 +1571,7 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+       std::make_unique<EnvironmentEgl>(wl_display_), enable_impeller));
+   render_surface_->SetNativeWindow(native_window_.get());
+ 
+-  if (view_properties_.use_window_decoration) {
++  if (view_properties_.use_window_decoration && !layer_shell_mode) {
+     if (zxdg_decoration_manager_v1_) {
+       ELINUX_LOG(INFO) << "Use server-side xdg-decoration mode";
+       zxdg_toplevel_decoration_v1_ =
+@@ -1465,7 +1590,7 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+     }
+   }
+ 
+-  // Wait for making sure that xdg_surface has been configured.
++  // Wait for making sure that the surface has been configured.
+   while (wait_for_configure_) {
+     wl_display_dispatch(wl_display_);
+   }
+@@ -1488,6 +1613,12 @@ void ELinuxWindowWayland::CreateDecoration(int32_t width_dip,
+ 
+ void ELinuxWindowWayland::DestroyRenderSurface() {
+   // destroy the main surface before destroying the client window on Wayland.
++  if (zwlr_layer_surface_v1_) {
++    zwlr_layer_surface_v1_destroy(zwlr_layer_surface_v1_);
++    zwlr_layer_surface_v1_ = nullptr;
++    layer_surface_configured_ = false;
++  }
++
+   if (window_decorations_) {
+     window_decorations_ = nullptr;
+   }
+@@ -1635,6 +1766,14 @@ void ELinuxWindowWayland::WlRegistryHandler(wl_registry* wl_registry,
+     return;
+   }
+ 
++  if (!strcmp(interface, zwlr_layer_shell_v1_interface.name)) {
++    constexpr uint32_t kMaxVersion = 5;
++    zwlr_layer_shell_v1_ = static_cast<decltype(zwlr_layer_shell_v1_)>(
++        wl_registry_bind(wl_registry, name, &zwlr_layer_shell_v1_interface,
++                         std::min(kMaxVersion, version)));
++    return;
++  }
++
+   if (!strcmp(interface, wl_seat_interface.name)) {
+     constexpr uint32_t kMaxVersion = 4;
+     auto [inserted, _] =
+diff --git a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h
+index 8ccb84b..284fdd9 100644
+--- a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h
++++ b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h
+@@ -24,6 +24,7 @@ extern "C" {
+ #include "wayland/protocols/presentation-time-protocol.h"
+ #include "wayland/protocols/text-input-unstable-v1-client-protocol.h"
+ #include "wayland/protocols/text-input-unstable-v3-client-protocol.h"
++#include "wayland/protocols/wlr-layer-shell-unstable-v1-client-protocol.h"
+ #include "wayland/protocols/xdg-decoration-unstable-v1-protocol.h"
+ #include "wayland/protocols/xdg-shell-client-protocol.h"
+ }
+@@ -140,6 +141,7 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
+       kWpPresentationFeedbackListener;
+   static const zxdg_toplevel_decoration_v1_listener
+       kZxdgToplevelDecorationV1Listener;
++  static const zwlr_layer_surface_v1_listener kZwlrLayerSurfaceV1Listener;
+   static constexpr size_t kDefaultPointerSize = 24;
+ 
+   std::unique_ptr<NativeWindowWayland> native_window_;
+@@ -187,6 +189,12 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
+   zxdg_decoration_manager_v1* zxdg_decoration_manager_v1_ = nullptr;
+   zxdg_toplevel_decoration_v1* zxdg_toplevel_decoration_v1_ = nullptr;
+ 
++  // wlr-layer-shell protocol. Used instead of xdg-shell when view_mode_ is
++  // FlutterDesktopViewMode::kLayerShell.
++  zwlr_layer_shell_v1* zwlr_layer_shell_v1_ = nullptr;
++  zwlr_layer_surface_v1* zwlr_layer_surface_v1_ = nullptr;
++  bool layer_surface_configured_ = false;
++
+   // Frame information for Vsync events.
+   wp_presentation* wp_presentation_;
+   uint32_t wp_presentation_clk_id_;
