@@ -3,6 +3,13 @@ cmake_minimum_required(VERSION 3.10)
 # user binary name.
 set(TARGET flutter-client)
 
+# MaterDE patch: export the embedder's C symbols (e.g.
+# FlutterDesktopLayerShellSetInputRegion) into the executable's dynamic symbol
+# table, so the Dart side can resolve them through
+# DynamicLibrary.process() (dart:ffi). flutter-client links the embedder
+# statically, hence -rdynamic.
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+
 # source files for user apps.
 set(USER_APP_SRCS
   examples/flutter-wayland-client/flutter/generated_plugin_registrant.cc

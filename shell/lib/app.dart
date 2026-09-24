@@ -1,8 +1,17 @@
 // Root widget for the MaterDE shell.
 
+import 'dart:io' show Platform;
+
 import 'package:flutter/material.dart';
 
+import 'shelf/shelf.dart';
 import 'theme/materde_theme.dart';
+
+/// Whether this process renders the shelf instead of the Phase 0 acceptance
+/// page. Set `MATERDE_UI=shelf` when launching flutter-client as the layer
+/// surface, with `-h` = `kShelfSurfaceHeight` (README §3). Without it the
+/// acceptance page renders, which is what Phase 0 re-runs use.
+final bool kShelfMode = Platform.environment['MATERDE_UI'] == 'shelf';
 
 /// The MaterDE application root.
 ///
@@ -44,11 +53,13 @@ class _MaterdeAppState extends State<MaterdeApp> {
       darkTheme: materdeTheme(seed: _seed, brightness: Brightness.dark),
       themeMode:
           _brightness == Brightness.dark ? ThemeMode.dark : ThemeMode.light,
-      home: _HomeView(
-        seed: _seed,
-        onSeedChanged: _setSeed,
-        onToggleBrightness: _toggleBrightness,
-      ),
+      home: kShelfMode
+          ? const MaterdeShelf()
+          : _HomeView(
+              seed: _seed,
+              onSeedChanged: _setSeed,
+              onToggleBrightness: _toggleBrightness,
+            ),
     );
   }
 }

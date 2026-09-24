@@ -91,6 +91,12 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
   // |FlutterWindowBindingHandler|
   void SetClipboardData(const std::string& data) override;
 
+  // MaterDE patch: restricts the layer-shell surface's input region to a
+  // surface-local rectangle (logical px). width/height <= 0 restores input
+  // over the whole surface. Only meaningful in kLayerShell mode.
+  void SetLayerShellInputRegion(int32_t x, int32_t y, int32_t width,
+                                int32_t height);
+
  private:
   struct CursorInfo {
     std::string cursor_name;

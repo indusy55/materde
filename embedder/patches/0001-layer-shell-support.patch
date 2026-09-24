@@ -98,10 +98,10 @@ index 69b5879..0000000
 -      run: cmake --build . --config $BUILD_TYPE
 diff --git a/LAYER-SHELL-NOTES.md b/LAYER-SHELL-NOTES.md
 new file mode 100644
-index 0000000..df0a985
+index 0000000..2c0ad1d
 --- /dev/null
 +++ b/LAYER-SHELL-NOTES.md
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,570 @@
 +# Embedder Layer-Shell 改造笔记（Phase 0 第 5/6 项）
 +
 +> 目标：给 fork 的 `flutter-embedded-linux` 加 `wlr-layer-shell` 支持，让 Flutter 应用能创建
@@ -616,6 +616,62 @@ index 0000000..df0a985
 +- `poc/`（C 版 + Rust 版两个 PoC）验收通过后删除；其唯一未沉淀进本文的事实
 +  （指针 ENTER/MOTION/LEAVE 输入路由日志、`wl_output.scale` 整数限制）
 +  已记入 `docs/08-risk-analysis.md` 的 Go/No-Go 证据摘要与风险 #5 验证记录。
++
++## 14. Phase 1 Commit A：动态 input region + 高 surface + 尺寸竞态修复（2026-09-24）
++
++### 动机与设计
++
++48px 高的 surface 放不下 tooltip / 右键菜单（PopupMenu 需要竖向空间）。方案：
++
++- surface 加高到 **248 = 48 可见 bar + 200 透明带**（`-h 248`）。
++  EGL 配置带 `EGL_ALPHA_SIZE=8`，Flutter 根画布透明实测可用（透明带透出后面窗口）。
++- **视觉**：只画底部 48（`MaterdeShelf`：透明 Scaffold + 底部 ColoredBox）。
++- **输入**：动态 `wl_surface.set_input_region` —— 平时只留底部 48
++  （透明带点击穿透给后面窗口），菜单打开时恢复整面
++  （菜单接收指针 + 点击外部经 barrier 关闭）。
++- exclusive 仍是 48（与 surface 高度无关，窗口只让出底部 48）。
++
++### 新增接口
++
++- **C API**：`FlutterDesktopLayerShellSetInputRegion(x, y, w, h)`
++  （`public/flutter_elinux.h` 声明，`elinux_window_wayland.cc` 实现；
++  w/h ≤ 0 = 整面）。surface-local 逻辑坐标。单视图用文件级
++  `g_layer_shell_window` 注册（layer surface 创建时登记、析构清理）。
++  set 后立即 `wl_surface_commit + flush`（input region 是双缓冲状态）。
++- **-rdynamic**：flutter-client **静态**链接 embedder ⇒ 符号默认只在
++  `.symtab`。Dart `DynamicLibrary.process()`（= `dlopen(NULL)`）需要
++  `.dynsym` ⇒ `examples/flutter-wayland-client/cmake/user_build.cmake`
++  里 `CMAKE_EXE_LINKER_FLAGS += -rdynamic`。验证：
++  `nm -D build/flutter-client | grep FlutterDesktopLayerShellSetInputRegion` → `T`。
++- **Dart 侧**：`shell/lib/wayland/layer_shell.dart`（封装；符号缺失降级 no-op，
++  `flutter test` 不炸）；`MATERDE_UI=shelf` 环境变量切 shelf UI
++  （不设 = Phase 0 acceptance 页，`-h 48` 路径仍可复跑）。
++
++### ⚠️ 尺寸竞态 bug（本 commit 修复，Phase 0 埋下）
++
++layer configure 监听器原先只置 `request_redraw_`，由下一轮 `DispatchEvent()`
++（~line 1422）消费回传尺寸。两个竞态源：
++
++1. `wl_output.scale` 处理（~line 2104）置**同一标志**，消费顺序不定；
++2. `-w 0` 时 `view_properties_.width` 初值 0，标志可能先被以
++   `OnWindowSizeChanged(0, h×scale)` 消费掉。
++
++症状：引擎卡在占位视口 1280×720（逻辑 640 宽）—— 画面上只有左侧
++640 逻辑 px（= 1120 物理）有内容，bar 画到视口底 = 屏幕外，exclusive 不生效。
++COSMIC 实测**老代码 1/3 全宽**（probe_top 当时连续两次全宽纯属运气）。
++
++**修复**：layer configure 回调内**直接**调
++`OnWindowSizeChanged(w×scale, h×scale − decor)`（与 drm 后端 ~line 402 同款），
++`DispatchEvent` 循环消费路径保留（scale 变更仍走它）。修复后 **5/5 全宽**。
++
++### 验收记录（2026-09-24，COSMIC，eDP-1 scale 1.75）
++
++- 日志：`configure: 1646x248` → `layer surface resized to 1646x48(248)` →
++  `Layer surface input region set to 0,200 1646x48`。
++- bar：y1718–1799 整宽一致（82px = 48 逻辑），色 = `surfaceContainer` (33,31,36)。
++- 透明带：y1468–1716 透出后面窗口/墙纸原色（差值 1.70）。
++- exclusive：窗口止于 y1716，bar 从 y1718 起。
++- 点击穿透：人肉点 bar 正上方窗口有反应 ✓。
 diff --git a/cmake/build.cmake b/cmake/build.cmake
 index ad69502..a3c0cc0 100644
 --- a/cmake/build.cmake
@@ -686,6 +742,24 @@ index e320299..92885a4 100644
      DEPENDS ${_xml_file} VERBATIM
    )
  
+diff --git a/examples/flutter-wayland-client/cmake/user_build.cmake b/examples/flutter-wayland-client/cmake/user_build.cmake
+index 8bcd69a..1006c72 100644
+--- a/examples/flutter-wayland-client/cmake/user_build.cmake
++++ b/examples/flutter-wayland-client/cmake/user_build.cmake
+@@ -3,6 +3,13 @@ cmake_minimum_required(VERSION 3.10)
+ # user binary name.
+ set(TARGET flutter-client)
+ 
++# MaterDE patch: export the embedder's C symbols (e.g.
++# FlutterDesktopLayerShellSetInputRegion) into the executable's dynamic symbol
++# table, so the Dart side can resolve them through
++# DynamicLibrary.process() (dart:ffi). flutter-client links the embedder
++# statically, hence -rdynamic.
++set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
++
+ # source files for user apps.
+ set(USER_APP_SRCS
+   examples/flutter-wayland-client/flutter/generated_plugin_registrant.cc
 diff --git a/examples/flutter-wayland-client/flutter_embedder_options.h b/examples/flutter-wayland-client/flutter_embedder_options.h
 index 41d0bd1..7751dfd 100644
 --- a/examples/flutter-wayland-client/flutter_embedder_options.h
@@ -1462,10 +1536,10 @@ index d0c12ba..becdaa9 100644
  namespace flutter {
  
 diff --git a/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h b/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h
-index eacb526..dbfa683 100644
+index eacb526..2b1e374 100644
 --- a/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h
 +++ b/src/flutter/shell/platform/linux_embedded/public/flutter_elinux.h
-@@ -60,8 +60,65 @@ enum FlutterDesktopViewMode {
+@@ -60,8 +60,79 @@ enum FlutterDesktopViewMode {
    kNormalscreen = 0,
    // Shows always the Flutter view by fullscreen.
    kFullscreen = 1,
@@ -1528,10 +1602,24 @@ index eacb526..dbfa683 100644
 +  uint32_t keyboard_interactivity;
 +} FlutterDesktopLayerShellProperties;
 +
++// MaterDE patch: restricts the input (pointer/touch) region of the active
++// wlr-layer-shell surface at runtime, in surface-local logical coordinates
++// with the origin at the surface's top-left. Passing width<=0 or height<=0
++// resets the input region to the whole surface. This is what lets the shelf
++// keep the area above its 48px bar click-through while still showing context
++// menus/tooltips there (the surface is taller than the bar and the extra zone
++// is visually transparent). No-op when there is no layer surface. Requests are
++// marshalled to the compositor from the calling thread, which libwayland
++// handles thread-safely alongside the platform thread's dispatch loop.
++FLUTTER_EXPORT void FlutterDesktopLayerShellSetInputRegion(int32_t x,
++                                                            int32_t y,
++                                                            int32_t width,
++                                                            int32_t height);
++
  // The View rotation setting.
  enum FlutterDesktopViewRotation {
    // Rotation constant: 0 degree rotation (natural orientation)
-@@ -86,7 +143,9 @@ typedef struct {
+@@ -86,7 +157,9 @@ typedef struct {
    FlutterDesktopViewRotation view_rotation;
  
    // View display mode. If you set kFullscreen, the parameters of both `width`
@@ -1542,7 +1630,7 @@ index eacb526..dbfa683 100644
    FlutterDesktopViewMode view_mode;
  
    // View title.
-@@ -120,6 +179,9 @@ typedef struct {
+@@ -120,6 +193,9 @@ typedef struct {
    // True:  Sync to compositor redraw/v-blank  (eglSwapInterval 1)
    // False: Do not sync to compositor redraw/v-blank (eglSwapInterval 0)
    bool enable_vsync;
@@ -1553,10 +1641,59 @@ index eacb526..dbfa683 100644
  
  // ========== View Controller ==========
 diff --git a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
-index 6467bf9..8a77300 100644
+index 6467bf9..31379cf 100644
 --- a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
 +++ b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
-@@ -687,7 +687,11 @@ const wl_output_listener ELinuxWindowWayland::kWlOutputListener = {
+@@ -43,8 +43,48 @@ constexpr char kWlCursorThemeWatch[] = "watch";
+ constexpr char kCursorNameNone[] = "none";
+ 
+ constexpr char kClipboardMimeTypeText[] = "text/plain";
++
++// The layer-shell window this process created, if any (MaterDE patch). It is
++// how Dart reaches the surface through FlutterDesktopLayerShellSetInputRegion
++// via FFI; a flutter-client process only ever has one view.
++ELinuxWindowWayland* g_layer_shell_window = nullptr;
+ }  // namespace
+ 
++extern "C" void FlutterDesktopLayerShellSetInputRegion(int32_t x, int32_t y,
++                                                        int32_t width,
++                                                        int32_t height) {
++  if (g_layer_shell_window) {
++    g_layer_shell_window->SetLayerShellInputRegion(x, y, width, height);
++  }
++}
++
++void ELinuxWindowWayland::SetLayerShellInputRegion(int32_t x, int32_t y,
++                                                   int32_t width,
++                                                   int32_t height) {
++  if (!zwlr_layer_surface_v1_ || !native_window_ || !wl_compositor_) {
++    return;
++  }
++  wl_surface* surface = native_window_->Surface();
++  wl_region* region = wl_compositor_create_region(wl_compositor_);
++  if (!region) {
++    ELINUX_LOG(ERROR) << "Failed to create an input region.";
++    return;
++  }
++  if (width <= 0 || height <= 0) {
++    // The whole surface accepts input again (the protocol default).
++    wl_region_add(region, 0, 0, 0x40000000, 0x40000000);
++  } else {
++    wl_region_add(region, x, y, width, height);
++  }
++  wl_surface_set_input_region(surface, region);
++  wl_region_destroy(region);
++  // The input region is double-buffered state: commit applies it immediately.
++  wl_surface_commit(surface);
++  wl_display_flush(wl_display_);
++  ELINUX_LOG(INFO) << "Layer surface input region set to " << x << "," << y
++                   << " " << width << "x" << height;
++}
++
+ const wl_registry_listener ELinuxWindowWayland::kWlRegistryListener = {
+     .global =
+         [](void* data,
+@@ -687,7 +727,11 @@ const wl_output_listener ELinuxWindowWayland::kWlOutputListener = {
            self->request_redraw_ = true;
          }
  
@@ -1569,7 +1706,7 @@ index 6467bf9..8a77300 100644
            ELINUX_LOG(WARNING)
                << "Requested width size(" << self->view_properties_.width << ") "
                << "is larger than display size(" << width
-@@ -696,7 +700,9 @@ const wl_output_listener ELinuxWindowWayland::kWlOutputListener = {
+@@ -696,7 +740,9 @@ const wl_output_listener ELinuxWindowWayland::kWlOutputListener = {
            self->view_properties_.width = width;
            self->request_redraw_ = true;
          }
@@ -1580,7 +1717,7 @@ index 6467bf9..8a77300 100644
            ELINUX_LOG(WARNING)
                << "Requested height size(" << self->view_properties_.height
                << ") " << "is larger than display size(" << height
-@@ -1050,6 +1056,49 @@ const zxdg_toplevel_decoration_v1_listener
+@@ -1050,6 +1096,64 @@ const zxdg_toplevel_decoration_v1_listener
          },
  };
  
@@ -1616,6 +1753,21 @@ index 6467bf9..8a77300 100644
 +          if (self->wait_for_configure_) {
 +            self->wait_for_configure_ = false;
 +          }
++          // MaterDE fix: propagate the granted geometry to the engine right
++          // away, like the drm backend does from its configure callback.
++          // Relying on the request_redraw_ flag alone raced against the
++          // wl_output.scale handling in DispatchEvent() (both write the same
++          // flag; with -w 0 the pending consumption also ran with
++          // view_properties_.width == 0), which left Flutter stuck at the
++          // placeholder viewport in ~2/3 of runs on COSMIC — the surface then
++          // only ever painted the leftmost 640 logical px.
++          if (self->view_properties_.width > 0 &&
++              self->binding_handler_delegate_) {
++            self->binding_handler_delegate_->OnWindowSizeChanged(
++                self->view_properties_.width * self->current_scale_,
++                self->view_properties_.height * self->current_scale_ -
++                    self->WindowDecorationsPhysicalHeight());
++          }
 +          self->request_redraw_ = true;
 +        },
 +        .closed =
@@ -1630,7 +1782,17 @@ index 6467bf9..8a77300 100644
  ELinuxWindowWayland::ELinuxWindowWayland(
      FlutterDesktopViewProperties view_properties)
      : cursor_info_({"", 0, nullptr}),
-@@ -1183,6 +1232,26 @@ ELinuxWindowWayland::~ELinuxWindowWayland() {
+@@ -1141,6 +1245,9 @@ ELinuxWindowWayland::ELinuxWindowWayland(
+ }
+ 
+ ELinuxWindowWayland::~ELinuxWindowWayland() {
++  if (g_layer_shell_window == this) {
++    g_layer_shell_window = nullptr;
++  }
+   display_valid_ = false;
+   running_ = false;
+ 
+@@ -1183,6 +1290,26 @@ ELinuxWindowWayland::~ELinuxWindowWayland() {
      }
    }
  
@@ -1657,7 +1819,7 @@ index 6467bf9..8a77300 100644
    if (wl_data_offer_) {
      wl_data_offer_destroy(wl_data_offer_);
      wl_data_offer_ = nullptr;
-@@ -1376,7 +1445,15 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+@@ -1376,7 +1503,15 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
      return false;
    }
  
@@ -1674,7 +1836,7 @@ index 6467bf9..8a77300 100644
      ELINUX_LOG(ERROR) << "Xdg-shell is invalid";
      return false;
    }
-@@ -1386,6 +1463,23 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+@@ -1386,6 +1521,23 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
      height_px = view_properties_.height * current_scale_;
    }
  
@@ -1698,7 +1860,7 @@ index 6467bf9..8a77300 100644
    ELINUX_LOG(TRACE) << "Created the Wayland surface: " << width_px << "x"
                      << height_px;
    if (view_properties_.use_mouse_cursor) {
-@@ -1405,22 +1499,57 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+@@ -1405,22 +1557,59 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
  
    wl_surface_add_listener(native_window_->Surface(), &kWlSurfaceListener, this);
  
@@ -1722,6 +1884,8 @@ index 6467bf9..8a77300 100644
 +    }
 +    zwlr_layer_surface_v1_add_listener(zwlr_layer_surface_v1_,
 +                                       &kZwlrLayerSurfaceV1Listener, this);
++    // MaterDE patch: expose the surface to FlutterDesktopLayerShellSetInputRegion.
++    g_layer_shell_window = this;
 +    zwlr_layer_surface_v1_set_size(
 +        zwlr_layer_surface_v1_,
 +        view_properties_.width > 0 ? view_properties_.width : 0,
@@ -1770,7 +1934,7 @@ index 6467bf9..8a77300 100644
    wl_surface_set_buffer_scale(native_window_->Surface(), current_scale_);
  
    {
-@@ -1435,10 +1564,6 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+@@ -1435,10 +1624,6 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
      }
    }
  
@@ -1781,7 +1945,7 @@ index 6467bf9..8a77300 100644
    wait_for_configure_ = true;
    wl_surface_commit(native_window_->Surface());
  
-@@ -1446,7 +1571,7 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+@@ -1446,7 +1631,7 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
        std::make_unique<EnvironmentEgl>(wl_display_), enable_impeller));
    render_surface_->SetNativeWindow(native_window_.get());
  
@@ -1790,7 +1954,7 @@ index 6467bf9..8a77300 100644
      if (zxdg_decoration_manager_v1_) {
        ELINUX_LOG(INFO) << "Use server-side xdg-decoration mode";
        zxdg_toplevel_decoration_v1_ =
-@@ -1465,7 +1590,7 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
+@@ -1465,7 +1650,7 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
      }
    }
  
@@ -1799,7 +1963,7 @@ index 6467bf9..8a77300 100644
    while (wait_for_configure_) {
      wl_display_dispatch(wl_display_);
    }
-@@ -1488,6 +1613,12 @@ void ELinuxWindowWayland::CreateDecoration(int32_t width_dip,
+@@ -1488,6 +1673,12 @@ void ELinuxWindowWayland::CreateDecoration(int32_t width_dip,
  
  void ELinuxWindowWayland::DestroyRenderSurface() {
    // destroy the main surface before destroying the client window on Wayland.
@@ -1812,7 +1976,7 @@ index 6467bf9..8a77300 100644
    if (window_decorations_) {
      window_decorations_ = nullptr;
    }
-@@ -1635,6 +1766,14 @@ void ELinuxWindowWayland::WlRegistryHandler(wl_registry* wl_registry,
+@@ -1635,6 +1826,14 @@ void ELinuxWindowWayland::WlRegistryHandler(wl_registry* wl_registry,
      return;
    }
  
@@ -1828,7 +1992,7 @@ index 6467bf9..8a77300 100644
      constexpr uint32_t kMaxVersion = 4;
      auto [inserted, _] =
 diff --git a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h
-index 8ccb84b..284fdd9 100644
+index 8ccb84b..e7a05b7 100644
 --- a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h
 +++ b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.h
 @@ -24,6 +24,7 @@ extern "C" {
@@ -1839,7 +2003,20 @@ index 8ccb84b..284fdd9 100644
  #include "wayland/protocols/xdg-decoration-unstable-v1-protocol.h"
  #include "wayland/protocols/xdg-shell-client-protocol.h"
  }
-@@ -140,6 +141,7 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
+@@ -90,6 +91,12 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
+   // |FlutterWindowBindingHandler|
+   void SetClipboardData(const std::string& data) override;
+ 
++  // MaterDE patch: restricts the layer-shell surface's input region to a
++  // surface-local rectangle (logical px). width/height <= 0 restores input
++  // over the whole surface. Only meaningful in kLayerShell mode.
++  void SetLayerShellInputRegion(int32_t x, int32_t y, int32_t width,
++                                int32_t height);
++
+  private:
+   struct CursorInfo {
+     std::string cursor_name;
+@@ -140,6 +147,7 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
        kWpPresentationFeedbackListener;
    static const zxdg_toplevel_decoration_v1_listener
        kZxdgToplevelDecorationV1Listener;
@@ -1847,7 +2024,7 @@ index 8ccb84b..284fdd9 100644
    static constexpr size_t kDefaultPointerSize = 24;
  
    std::unique_ptr<NativeWindowWayland> native_window_;
-@@ -187,6 +189,12 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
+@@ -187,6 +195,12 @@ class ELinuxWindowWayland : public ELinuxWindow, public WindowBindingHandler {
    zxdg_decoration_manager_v1* zxdg_decoration_manager_v1_ = nullptr;
    zxdg_toplevel_decoration_v1* zxdg_toplevel_decoration_v1_ = nullptr;
  

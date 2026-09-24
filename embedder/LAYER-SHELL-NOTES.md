@@ -512,3 +512,59 @@ engine 卡在 AOT（没有 `libapp.so`）⇒ 永远黑屏 ⇒ Phase 0 #7「看�
 - `poc/`（C 版 + Rust 版两个 PoC）验收通过后删除；其唯一未沉淀进本文的事实
   （指针 ENTER/MOTION/LEAVE 输入路由日志、`wl_output.scale` 整数限制）
   已记入 `docs/08-risk-analysis.md` 的 Go/No-Go 证据摘要与风险 #5 验证记录。
+
+## 14. Phase 1 Commit A：动态 input region + 高 surface + 尺寸竞态修复（2026-09-24）
+
+### 动机与设计
+
+48px 高的 surface 放不下 tooltip / 右键菜单（PopupMenu 需要竖向空间）。方案：
+
+- surface 加高到 **248 = 48 可见 bar + 200 透明带**（`-h 248`）。
+  EGL 配置带 `EGL_ALPHA_SIZE=8`，Flutter 根画布透明实测可用（透明带透出后面窗口）。
+- **视觉**：只画底部 48（`MaterdeShelf`：透明 Scaffold + 底部 ColoredBox）。
+- **输入**：动态 `wl_surface.set_input_region` —— 平时只留底部 48
+  （透明带点击穿透给后面窗口），菜单打开时恢复整面
+  （菜单接收指针 + 点击外部经 barrier 关闭）。
+- exclusive 仍是 48（与 surface 高度无关，窗口只让出底部 48）。
+
+### 新增接口
+
+- **C API**：`FlutterDesktopLayerShellSetInputRegion(x, y, w, h)`
+  （`public/flutter_elinux.h` 声明，`elinux_window_wayland.cc` 实现；
+  w/h ≤ 0 = 整面）。surface-local 逻辑坐标。单视图用文件级
+  `g_layer_shell_window` 注册（layer surface 创建时登记、析构清理）。
+  set 后立即 `wl_surface_commit + flush`（input region 是双缓冲状态）。
+- **-rdynamic**：flutter-client **静态**链接 embedder ⇒ 符号默认只在
+  `.symtab`。Dart `DynamicLibrary.process()`（= `dlopen(NULL)`）需要
+  `.dynsym` ⇒ `examples/flutter-wayland-client/cmake/user_build.cmake`
+  里 `CMAKE_EXE_LINKER_FLAGS += -rdynamic`。验证：
+  `nm -D build/flutter-client | grep FlutterDesktopLayerShellSetInputRegion` → `T`。
+- **Dart 侧**：`shell/lib/wayland/layer_shell.dart`（封装；符号缺失降级 no-op，
+  `flutter test` 不炸）；`MATERDE_UI=shelf` 环境变量切 shelf UI
+  （不设 = Phase 0 acceptance 页，`-h 48` 路径仍可复跑）。
+
+### ⚠️ 尺寸竞态 bug（本 commit 修复，Phase 0 埋下）
+
+layer configure 监听器原先只置 `request_redraw_`，由下一轮 `DispatchEvent()`
+（~line 1422）消费回传尺寸。两个竞态源：
+
+1. `wl_output.scale` 处理（~line 2104）置**同一标志**，消费顺序不定；
+2. `-w 0` 时 `view_properties_.width` 初值 0，标志可能先被以
+   `OnWindowSizeChanged(0, h×scale)` 消费掉。
+
+症状：引擎卡在占位视口 1280×720（逻辑 640 宽）—— 画面上只有左侧
+640 逻辑 px（= 1120 物理）有内容，bar 画到视口底 = 屏幕外，exclusive 不生效。
+COSMIC 实测**老代码 1/3 全宽**（probe_top 当时连续两次全宽纯属运气）。
+
+**修复**：layer configure 回调内**直接**调
+`OnWindowSizeChanged(w×scale, h×scale − decor)`（与 drm 后端 ~line 402 同款），
+`DispatchEvent` 循环消费路径保留（scale 变更仍走它）。修复后 **5/5 全宽**。
+
+### 验收记录（2026-09-24，COSMIC，eDP-1 scale 1.75）
+
+- 日志：`configure: 1646x248` → `layer surface resized to 1646x48(248)` →
+  `Layer surface input region set to 0,200 1646x48`。
+- bar：y1718–1799 整宽一致（82px = 48 逻辑），色 = `surfaceContainer` (33,31,36)。
+- 透明带：y1468–1716 透出后面窗口/墙纸原色（差值 1.70）。
+- exclusive：窗口止于 y1716，bar 从 y1718 起。
+- 点击穿透：人肉点 bar 正上方窗口有反应 ✓。

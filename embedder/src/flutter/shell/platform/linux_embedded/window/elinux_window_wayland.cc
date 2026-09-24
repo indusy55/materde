@@ -43,7 +43,47 @@ constexpr char kWlCursorThemeWatch[] = "watch";
 constexpr char kCursorNameNone[] = "none";
 
 constexpr char kClipboardMimeTypeText[] = "text/plain";
+
+// The layer-shell window this process created, if any (MaterDE patch). It is
+// how Dart reaches the surface through FlutterDesktopLayerShellSetInputRegion
+// via FFI; a flutter-client process only ever has one view.
+ELinuxWindowWayland* g_layer_shell_window = nullptr;
 }  // namespace
+
+extern "C" void FlutterDesktopLayerShellSetInputRegion(int32_t x, int32_t y,
+                                                        int32_t width,
+                                                        int32_t height) {
+  if (g_layer_shell_window) {
+    g_layer_shell_window->SetLayerShellInputRegion(x, y, width, height);
+  }
+}
+
+void ELinuxWindowWayland::SetLayerShellInputRegion(int32_t x, int32_t y,
+                                                   int32_t width,
+                                                   int32_t height) {
+  if (!zwlr_layer_surface_v1_ || !native_window_ || !wl_compositor_) {
+    return;
+  }
+  wl_surface* surface = native_window_->Surface();
+  wl_region* region = wl_compositor_create_region(wl_compositor_);
+  if (!region) {
+    ELINUX_LOG(ERROR) << "Failed to create an input region.";
+    return;
+  }
+  if (width <= 0 || height <= 0) {
+    // The whole surface accepts input again (the protocol default).
+    wl_region_add(region, 0, 0, 0x40000000, 0x40000000);
+  } else {
+    wl_region_add(region, x, y, width, height);
+  }
+  wl_surface_set_input_region(surface, region);
+  wl_region_destroy(region);
+  // The input region is double-buffered state: commit applies it immediately.
+  wl_surface_commit(surface);
+  wl_display_flush(wl_display_);
+  ELINUX_LOG(INFO) << "Layer surface input region set to " << x << "," << y
+                   << " " << width << "x" << height;
+}
 
 const wl_registry_listener ELinuxWindowWayland::kWlRegistryListener = {
     .global =
@@ -1088,6 +1128,21 @@ const zwlr_layer_surface_v1_listener
           if (self->wait_for_configure_) {
             self->wait_for_configure_ = false;
           }
+          // MaterDE fix: propagate the granted geometry to the engine right
+          // away, like the drm backend does from its configure callback.
+          // Relying on the request_redraw_ flag alone raced against the
+          // wl_output.scale handling in DispatchEvent() (both write the same
+          // flag; with -w 0 the pending consumption also ran with
+          // view_properties_.width == 0), which left Flutter stuck at the
+          // placeholder viewport in ~2/3 of runs on COSMIC — the surface then
+          // only ever painted the leftmost 640 logical px.
+          if (self->view_properties_.width > 0 &&
+              self->binding_handler_delegate_) {
+            self->binding_handler_delegate_->OnWindowSizeChanged(
+                self->view_properties_.width * self->current_scale_,
+                self->view_properties_.height * self->current_scale_ -
+                    self->WindowDecorationsPhysicalHeight());
+          }
           self->request_redraw_ = true;
         },
         .closed =
@@ -1190,6 +1245,9 @@ ELinuxWindowWayland::ELinuxWindowWayland(
 }
 
 ELinuxWindowWayland::~ELinuxWindowWayland() {
+  if (g_layer_shell_window == this) {
+    g_layer_shell_window = nullptr;
+  }
   display_valid_ = false;
   running_ = false;
 
@@ -1512,6 +1570,8 @@ bool ELinuxWindowWayland::CreateRenderSurface(int32_t width_px,
     }
     zwlr_layer_surface_v1_add_listener(zwlr_layer_surface_v1_,
                                        &kZwlrLayerSurfaceV1Listener, this);
+    // MaterDE patch: expose the surface to FlutterDesktopLayerShellSetInputRegion.
+    g_layer_shell_window = this;
     zwlr_layer_surface_v1_set_size(
         zwlr_layer_surface_v1_,
         view_properties_.width > 0 ? view_properties_.width : 0,

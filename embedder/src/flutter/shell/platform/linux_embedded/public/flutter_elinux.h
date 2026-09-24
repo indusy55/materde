@@ -119,6 +119,20 @@ typedef struct {
   uint32_t keyboard_interactivity;
 } FlutterDesktopLayerShellProperties;
 
+// MaterDE patch: restricts the input (pointer/touch) region of the active
+// wlr-layer-shell surface at runtime, in surface-local logical coordinates
+// with the origin at the surface's top-left. Passing width<=0 or height<=0
+// resets the input region to the whole surface. This is what lets the shelf
+// keep the area above its 48px bar click-through while still showing context
+// menus/tooltips there (the surface is taller than the bar and the extra zone
+// is visually transparent). No-op when there is no layer surface. Requests are
+// marshalled to the compositor from the calling thread, which libwayland
+// handles thread-safely alongside the platform thread's dispatch loop.
+FLUTTER_EXPORT void FlutterDesktopLayerShellSetInputRegion(int32_t x,
+                                                            int32_t y,
+                                                            int32_t width,
+                                                            int32_t height);
+
 // The View rotation setting.
 enum FlutterDesktopViewRotation {
   // Rotation constant: 0 degree rotation (natural orientation)

@@ -72,26 +72,38 @@ ninja -C build
 
 ```bash
 cd embedder
-LD_LIBRARY_PATH=build FLUTTER_LOG_LEVELS=INFO ./build/flutter-client \
-  -b ../shell/build/elinux/x64/release/bundle \
-  --layer-shell -w 0 -h 48 -L 1 -A 14 -e 48 -N materde-shelf -y 0
+MATERDE_UI=shelf LD_LIBRARY_PATH=build FLUTTER_LOG_LEVELS=INFO \
+  ./build/flutter-client \
+  -b "$PWD/../shell/build/elinux/x64/release/bundle" \
+  --layer-shell -w 0 -h 248 -L 2 -A 14 -e 48 -N materde-shelf -y 0
 ```
 
-Expected log: `Created the layer surface: layer=1, anchor=14, exclusive_zone=48,
-keyboard_interactivity=0` → `configure: 1646x48` (width follows the output's
-logical width).
+`-b` must be absolute: the client resolves relative paths against its own
+executable directory (`embedder/build/`), not your shell's cwd.
+
+`MATERDE_UI=shelf` selects the shelf UI (`MaterdeShelf`); without it the
+Phase 0 acceptance page renders (that path still works with `-h 48`).
+
+The surface is `-h 248` = 48px visible bar + a 200px transparent zone above
+it where tooltips/context menus render. Only the bottom 48px accepts input
+while no menu is open (dynamic input region, `lib/wayland/layer_shell.dart`).
+
+Expected log: `Created the layer surface: layer=2, anchor=14, exclusive_zone=48,
+keyboard_interactivity=0` → `configure: 1646x248` (width follows the output's
+logical width). Layer `2` (top) is deliberate: panels live on the top layer;
+`bottom` gets covered by the COSMIC dock / KDE plasmashell (see docs/04).
 
 Layer-shell flags (added in Phase 0; see `flutter-client --help`):
 
 | Flag | Meaning | Value used here |
 |---|---|---|
 | `--layer-shell` | Create a layer surface instead of an xdg-shell window | on |
-| `-L, --layer` | 0=background 1=bottom 2=top 3=overlay | 1 (bottom shelf) |
+| `-L, --layer` | 0=background 1=bottom 2=top 3=overlay | 2 (top shelf — panels must be top, see docs/04) |
 | `-A, --anchor` | Bitmask: top=1 bottom=2 left=4 right=8 | 14 (bottom\|left\|right) |
 | `-e, --exclusive-zone` | Reserved zone (logical px) that pushes normal windows away | 48 |
 | `-N, --layer-namespace` | Layer surface namespace | materde-shelf |
 | `-y, --keyboard-interactive` | 0=none 1=exclusive 2=on_demand | 0 (shelf never grabs the keyboard) |
-| `-w` / `-h` | Placeholder size; give 0 on an anchored axis to stretch | 0 / 48 |
+| `-w` / `-h` | Placeholder size; give 0 on an anchored axis to stretch | 0 / 248 (48px bar + 200px transparent menu/tooltip zone) |
 
 Other common flags: `-b` bundle path, `-t` title, `-a` app-id, `-n` disable cursor,
 `-f` fullscreen.
@@ -120,8 +132,8 @@ Without `MATERDE_SEED`, the default seed is used.
 | Our own INFO/TRACE logs missing | Log level defaults to WARNING — add `FLUTTER_LOG_LEVELS=INFO` (or TRACE) |
 | `pkill -f "build/…"` kills your own shell | The pattern matches the outer shell's command line; use `pkill -x flutter-client` |
 | Screenshots show a stale frame / race with rebuilds | Rebuild, launch and screenshot **serially**; check `md5sum libapp.so` first |
-| grim can't capture the screen | KWin isn't supported; use `spectacle -b -n -o out.png` (with `mkdir -p` on the target dir first) |
-| Small probe surfaces hidden under plasmashell | Move them to the overlay layer: `-L 3 -A 5` |
+| grim can't capture the screen | Under KWin grim isn't supported — use `spectacle -b -n -o out.png` (`mkdir -p` the target dir first). In the current COSMIC session grim works: `grim -o eDP-1 out.png` |
+| Shelf/probe hidden under a panel (plasmashell / COSMIC dock) | Panels live on the **top** layer; probe with `-L 2` (or `-L 3` for overlays). The COSMIC dock was disabled for dev: `entries` → `["Panel"]` |
 | Weird CMake cache failures | Caused by concurrent flutter commands; delete `build/elinux/x64/*/CMakeFiles` and re-run |
 
 ## Syncing with upstream (`embedder/`)
